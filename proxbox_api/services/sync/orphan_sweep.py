@@ -47,6 +47,60 @@ LiveVmKey = tuple[str, int, str]
 _RecordT = TypeVar("_RecordT")
 
 
+def _retirement_rules_by_site(value: object) -> dict[int, dict] | None:
+    """Validate the plugin-owned policy before any write; null is legacy behavior."""
+    if value is None:
+        return None
+    if not isinstance(value, list) or len(value) > 1024:
+        raise ProxboxException(message="Invalid orphan retirement rules", http_status_code=502)
+    rules = {}
+    for rule in value:
+        if not isinstance(rule, dict) or set(rule) - {"site_id", "status", "tag_id"}:
+            raise ProxboxException(message="Invalid orphan retirement rule", http_status_code=502)
+        site_id, status, tag_id = rule.get("site_id"), rule.get("status"), rule.get("tag_id")
+        if (
+            type(site_id) is not int
+            or site_id <= 0
+            or site_id in rules
+            or status not in ("report_only", "offline", "decommissioning")
+            or ("tag_id" in rule and (type(tag_id) is not int or tag_id <= 0))
+            or (status == "report_only" and "tag_id" in rule)
+        ):
+            raise ProxboxException(message="Invalid orphan retirement rule", http_status_code=502)
+        rules[site_id] = dict(rule)
+    return rules
+
+
+def _retirement_rule_for_candidate(rules: dict[int, dict] | None, candidate: dict) -> dict:
+    if rules is None:
+        return {"status": "decommissioning"}
+    site = candidate.get("site")
+    site_id = site.get("id") if isinstance(site, dict) else site
+    return (
+        rules.get(site_id, {"status": "report_only"})
+        if type(site_id) is int
+        else {"status": "report_only"}
+    )
+
+
+async def _read_orphan_retirement_rules(nb: object) -> object:
+    """Read current policy without either response cache or a permissive failure fallback."""
+    try:
+        rows = await rest_list_async(
+            nb, "/api/plugins/proxbox/settings/", query={"limit": 2}, authoritative=True
+        )
+        if len(rows) != 1:
+            raise ValueError("Settings row is not unique")
+        data = _record_to_dict(rows[0])
+        if data is None:
+            raise ValueError("Settings row is unreadable")
+        return data.get("orphan_retirement_rules")
+    except Exception as exc:
+        raise ProxboxException(
+            message="Cannot verify orphan retirement policy", http_status_code=502
+        ) from exc
+
+
 def is_delete_orphans_enabled() -> bool:
     """Return whether the ``delete_orphans`` setting (env override first) is on."""
     return get_bool(
@@ -539,8 +593,9 @@ async def clear_soft_delete_marker(
     """Remove the orphan marker when a VM is successfully re-adopted.
 
     ``restored_status`` is written in the same PATCH when the VM is still
-    ``decommissioning``. The bulk reconciliation diff normalizes every unknown NetBox
-    status to ``active``, so it cannot notice and undo the sweep's status change.
+    ``decommissioning`` or ``offline``. The bulk reconciliation diff normalizes every
+    unknown NetBox status to ``active``, so it cannot notice and undo every retirement
+    status change itself.
     """
     record = _record_to_dict(virtual_machine)
     if record is None or not _has_soft_delete_marker(record):
@@ -559,7 +614,7 @@ async def clear_soft_delete_marker(
         if (ref := _tag_ref(tag)) is not None
     ]
     payload: dict[str, object] = {"tags": refs}
-    if restored_status and _status_value(record) == SOFT_DELETED_VM_STATUS:
+    if restored_status and _status_value(record) in {SOFT_DELETED_VM_STATUS, "offline"}:
         payload["status"] = restored_status
     await rest_patch_async(nb, VIRTUAL_MACHINES_PATH, record_id, payload)
     return virtual_machine
@@ -662,6 +717,28 @@ async def _skip_live_candidate(
     )
 
 
+async def _verified_retirement_tags(
+    nb: object, fresh: dict, rule: dict, *, marker_id: int | None, ensure_marker: bool
+) -> tuple[list[dict[str, object]], int | None]:
+    """Verify an operator-selected existing tag before ensuring our own marker."""
+    additional_tag_id = rule.get("tag_id")
+    if additional_tag_id is not None:
+        tags = await rest_list_async(
+            nb, "/api/extras/tags/", query={"id": additional_tag_id, "limit": 2}, authoritative=True
+        )
+        tag = _record_to_dict(tags[0]) if len(tags) == 1 else None
+        if tag is None or _coerce_int(tag.get("id")) != additional_tag_id:
+            raise ProxboxException(
+                message="Cannot verify orphan retirement tag", http_status_code=502
+            )
+    if ensure_marker and marker_id is None:
+        marker_id = await _ensure_soft_delete_tag_id(nb)
+    refs = _soft_delete_tag_refs(fresh, soft_delete_tag_id=marker_id)
+    if additional_tag_id is not None and {"id": additional_tag_id} not in refs:
+        refs.append({"id": additional_tag_id})
+    return refs, marker_id
+
+
 async def soft_delete_orphan_vms(
     nb: object,
     candidates: Iterable[dict[str, object]],
@@ -673,12 +750,14 @@ async def soft_delete_orphan_vms(
     soft_delete_tag_id: int | None = None,
     live_vm_keys: Collection[LiveVmKey] | None = None,
     ensure_marker: bool = False,
+    retirement_rules: object = None,
 ) -> dict[str, object]:
     """Soft-delete or preview stale Proxbox-managed VMs.
 
     When ``live_vm_keys`` is given, a candidate is marked only if its guest is confirmed
     absent from that live inventory; present or unidentifiable guests are skipped.
     """
+    rules_by_site = _retirement_rules_by_site(retirement_rules)
     candidate_list = list(candidates)
     await _abort_for_touched_candidates(
         candidate_list,
@@ -723,6 +802,19 @@ async def soft_delete_orphan_vms(
                 stream,
                 item=item,
                 reason=live_reason,
+                run_id=run_id,
+                progress_current=index,
+                progress_total=total,
+            )
+            continue
+
+        rule = _retirement_rule_for_candidate(rules_by_site, candidate)
+        if rule["status"] == "report_only":
+            skipped += 1
+            await _skip_live_candidate(
+                stream,
+                item=item,
+                reason="retirement_report_only",
                 run_id=run_id,
                 progress_current=index,
                 progress_total=total,
@@ -775,16 +867,16 @@ async def soft_delete_orphan_vms(
             )
             continue
 
-        if ensure_marker and soft_delete_tag_id is None:
-            soft_delete_tag_id = await _ensure_soft_delete_tag_id(nb)
-        tag_refs = _soft_delete_tag_refs(fresh, soft_delete_tag_id=soft_delete_tag_id)
+        tag_refs, soft_delete_tag_id = await _verified_retirement_tags(
+            nb, fresh, rule, marker_id=soft_delete_tag_id, ensure_marker=ensure_marker
+        )
 
         try:
             await rest_patch_async(
                 nb,
                 VIRTUAL_MACHINES_PATH,
                 record_id,
-                {"status": "decommissioning", "tags": tag_refs},
+                {"status": rule["status"], "tags": tag_refs},
             )
         except Exception as error:
             if _is_not_found_error(error):
@@ -999,5 +1091,6 @@ async def run_orphan_vm_sweep(
         touched_vm_ids=touched_vm_ids,
         live_vm_keys=live_vm_keys,
         ensure_marker=True,
+        retirement_rules=await _read_orphan_retirement_rules(nb),
     )
     return {"enabled": enabled, "skipped_reason": None, **result}

@@ -61,9 +61,13 @@ def _stale_sidecar(monkeypatch: pytest.MonkeyPatch):
             return override if isinstance(override, dict) else None
         return {"id": record_id, "tags": list(_FRESH_TAGS.get(record_id, []))}
 
+    async def _legacy_rules(_nb: object):
+        return None
+
     _FRESH_OVERRIDE.clear()
     monkeypatch.setattr(orphan_sweep, "resolve_vm_sidecar_by_parent_id", _resolve)
     monkeypatch.setattr(orphan_sweep, "_fresh_vm_record", _fresh)
+    monkeypatch.setattr(orphan_sweep, "_read_orphan_retirement_rules", _legacy_rules)
     return readers
 
 
@@ -184,8 +188,9 @@ async def test_soft_delete_orphan_vms_patches_candidates_and_emits_progress(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("status", ["decommissioning", "offline"])
 async def test_clear_soft_delete_marker_preserves_other_tags(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, status: str,
 ) -> None:
     patches: list[tuple[int, dict[str, object]]] = []
 
@@ -199,18 +204,20 @@ async def test_clear_soft_delete_marker_preserves_other_tags(
     monkeypatch.setattr(orphan_sweep, "rest_patch_async", _fake_patch)
 
     record = _vm(5, "re-adopted", tag_slug=DISCOVERY_TAG_VM_QEMU)
+    record["status"] = status
     record["tags"] = [
         {"id": 10, "slug": DISCOVERY_TAG_VM_QEMU},
         {"id": 11, "slug": "customer-owned"},
         {"id": 12, "slug": "proxbox-soft-deleted"},
     ]
 
-    await clear_soft_delete_marker(object(), record)
+    await clear_soft_delete_marker(object(), record, restored_status="active")
 
     assert patches == [
         (
             5,
             {
+                "status": "active",
                 "tags": [
                     {"id": 10},
                     {"id": 11},
@@ -1103,3 +1110,99 @@ async def test_retirement_rechecks_authority_despite_warm_response_caches(
     assert result["soft_deleted"] == (0 if changed else 1)
     assert result["skipped"] == (1 if changed else 0)
     assert len(patches) == (0 if changed else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("rules", "site_id", "expected_status"),
+    [
+        (None, 901, "decommissioning"),
+        ([], 901, None),
+        ([{"site_id": 901, "status": "report_only"}], 901, None),
+        ([{"site_id": 901, "status": "offline"}], 902, None),
+        ([{"site_id": 901, "status": "offline"}], 901, "offline"),
+        ([{"site_id": 1, "status": "offline"}], True, None),
+        ([{"site_id": 1, "status": "offline"}], 1.5, None),
+    ],
+)
+async def test_site_retirement_policy_preserves_unowned_inventory(
+    monkeypatch, rules, site_id, expected_status
+):
+    candidate = _vm(31, "retirement-policy-workload")
+    candidate["site"] = {"id": site_id}
+    _FRESH_OVERRIDE[31] = dict(candidate)
+    patches = []
+
+    async def patch(_nb, _path, _record_id, payload):
+        patches.append(payload)
+        return payload
+
+    monkeypatch.setattr(orphan_sweep, "rest_patch_async", patch)
+    result = await soft_delete_orphan_vms(
+        object(),
+        [candidate],
+        run_id="current-run",
+        soft_delete_tag_id=71,
+        retirement_rules=rules,
+    )
+    assert result["soft_deleted"] == (0 if expected_status is None else 1)
+    assert [p["status"] for p in patches] == ([] if expected_status is None else [expected_status])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rules",
+    [
+        {},
+        [None],
+        [{"site_id": True, "status": "offline"}],
+        [{"site_id": 901, "status": "deleted"}],
+        [{"site_id": 901, "status": "offline", "tag_id": 1.9}],
+        [{"site_id": 901, "status": "offline", "extra": True}],
+        [{"site_id": 901, "status": "offline"}] * 2,
+    ],
+)
+async def test_invalid_retirement_policy_fails_before_any_write(monkeypatch, rules):
+    _forbid_writes(monkeypatch)
+    with pytest.raises(ProxboxException, match="Invalid orphan retirement"):
+        await soft_delete_orphan_vms(
+            object(),
+            [_vm(31, "invalid-policy-workload")],
+            run_id="current-run",
+            retirement_rules=rules,
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tag_exists", [True, False])
+async def test_site_retirement_requires_verified_tag_and_preserves_existing_tags(
+    monkeypatch, tag_exists
+):
+    candidate = _vm(31, "tagged-retirement-workload")
+    candidate["site"] = {"id": 901}
+    candidate["tags"] = [{"id": 41, "slug": "operator-owned"}]
+    _FRESH_OVERRIDE[31] = dict(candidate)
+    patches = []
+
+    async def tags(_nb, _path, **_kwargs):
+        return [{"id": 902}] if tag_exists else []
+
+    async def patch(_nb, _path, _record_id, payload):
+        patches.append(payload)
+        return payload
+
+    monkeypatch.setattr(orphan_sweep, "rest_list_async", tags)
+    monkeypatch.setattr(orphan_sweep, "rest_patch_async", patch)
+    kwargs = {
+        "run_id": "current-run",
+        "soft_delete_tag_id": 71,
+        "retirement_rules": [{"site_id": 901, "status": "offline", "tag_id": 902}],
+    }
+    if tag_exists:
+        result = await soft_delete_orphan_vms(object(), [candidate], **kwargs)
+        assert result["soft_deleted"] == 1
+        assert patches == [{"status": "offline", "tags": [{"id": 41}, {"id": 71}, {"id": 902}]}]
+    else:
+        with pytest.raises(ProxboxException, match="Cannot verify orphan retirement tag"):
+            await soft_delete_orphan_vms(object(), [candidate], **kwargs)
+        assert patches == []
