@@ -16,7 +16,7 @@ from proxbox_api.constants import (
 from proxbox_api.enum.status_mapping import ProxmoxToNetBoxVMStatus
 from proxbox_api.exception import ProxboxException
 from proxbox_api.logger import logger
-from proxbox_api.netbox_rest import rest_first_async, rest_patch_async
+from proxbox_api.netbox_rest import rest_list_async, rest_patch_async
 from proxbox_api.runtime_settings import get_bool
 from proxbox_api.schemas.stream_messages import ErrorCategory, ItemOperation
 from proxbox_api.services.sync.sync_state_reader import (
@@ -578,7 +578,7 @@ async def _no_longer_stale_reason(
     the discovery pass saw. NetBox offers no compare-and-set, so this narrows the
     discovery-to-PATCH race window but cannot close it atomically.
     """
-    sidecar = await resolve_vm_sidecar_by_parent_id(nb, record_id)
+    sidecar = await resolve_vm_sidecar_by_parent_id(nb, record_id, authoritative=True)
     if sidecar is None:
         return "its sync-state sidecar could not be re-read"
     current = str(sidecar.get("last_run_id") or "").strip()
@@ -593,33 +593,44 @@ async def _no_longer_stale_reason(
 async def _fresh_vm_record(nb: object, record_id: int) -> dict[str, object] | None:
     """Re-read one NetBox VM right before its PATCH; ``None`` when it cannot be read."""
     try:
-        record = await rest_first_async(
-            nb, VIRTUAL_MACHINES_PATH, query={"id": record_id, "limit": 2}
+        records = await rest_list_async(
+            nb, VIRTUAL_MACHINES_PATH, query={"id": record_id, "limit": 2}, authoritative=True
         )
     except Exception as error:  # noqa: BLE001
         logger.warning("Cannot re-read VM id=%s before soft-delete: %s", record_id, error)
         return None
-    data = _record_to_dict(record) if record is not None else None
+    data = _record_to_dict(records[0]) if len(records) == 1 else None
     if data is None or _coerce_int(data.get("id")) != record_id:
         return None
     return data
 
 
-async def _fresh_tag_refs(
-    nb: object, record_id: int, *, soft_delete_tag_id: int | None
-) -> tuple[list[dict[str, object]] | None, str | None]:
-    """Build the PATCH tag list from the freshly read VM tags plus the marker.
+async def _fresh_retirement_record(
+    nb: object, record_id: int, *, candidate: dict[str, object]
+) -> tuple[dict[str, object] | None, str | None]:
+    """Revalidate intent and placement before creating even the retirement marker.
 
-    Returns ``(refs, None)`` or ``(None, reason)`` with reason ``vm_unreadable`` or
-    ``already_soft_deleted``. NetBox has no atomic tag add, so a tiny window between
-    this read and the PATCH remains where a concurrently added tag can still be lost.
+    NetBox has no compare-and-set: a window between this read and the PATCH
+    remains. Retirement therefore still requires a single writer for its scope.
     """
     fresh = await _fresh_vm_record(nb, record_id)
     if fresh is None:
         return None, SKIP_REASON_VM_UNREADABLE
+    if _status_value(fresh) == "planned":
+        return None, "planned_inventory"
     if _has_soft_delete_marker(fresh):
         return None, SKIP_REASON_ALREADY_SWEPT
-    return _soft_delete_tag_refs(fresh, soft_delete_tag_id=soft_delete_tag_id), None
+    for field in ("site", "cluster"):
+        if field not in candidate:
+            continue
+        if field not in fresh:
+            return None, "placement_changed"
+        previous, current = candidate[field], fresh[field]
+        previous_id = _coerce_int(previous.get("id") if isinstance(previous, dict) else previous)
+        current_id = _coerce_int(current.get("id") if isinstance(current, dict) else current)
+        if previous_id != current_id or (previous is not None and previous_id is None):
+            return None, "placement_changed"
+    return fresh, None
 
 
 async def _skip_live_candidate(
@@ -661,6 +672,7 @@ async def soft_delete_orphan_vms(
     touched_vm_ids: set[int] | None = None,
     soft_delete_tag_id: int | None = None,
     live_vm_keys: Collection[LiveVmKey] | None = None,
+    ensure_marker: bool = False,
 ) -> dict[str, object]:
     """Soft-delete or preview stale Proxbox-managed VMs.
 
@@ -700,7 +712,11 @@ async def soft_delete_orphan_vms(
             )
             continue
 
-        live_reason = _live_presence_skip_reason(candidate, live_vm_keys)
+        live_reason = (
+            "planned_inventory"
+            if _status_value(candidate) == "planned"
+            else _live_presence_skip_reason(candidate, live_vm_keys)
+        )
         if live_reason is not None:
             skipped += 1
             await _skip_live_candidate(
@@ -746,10 +762,8 @@ async def soft_delete_orphan_vms(
             )
             continue
 
-        tag_refs, tag_skip = await _fresh_tag_refs(
-            nb, record_id, soft_delete_tag_id=soft_delete_tag_id
-        )
-        if tag_refs is None:
+        fresh, tag_skip = await _fresh_retirement_record(nb, record_id, candidate=candidate)
+        if fresh is None:
             skipped += 1
             await _skip_live_candidate(
                 stream,
@@ -760,6 +774,10 @@ async def soft_delete_orphan_vms(
                 progress_total=total,
             )
             continue
+
+        if ensure_marker and soft_delete_tag_id is None:
+            soft_delete_tag_id = await _ensure_soft_delete_tag_id(nb)
+        tag_refs = _soft_delete_tag_refs(fresh, soft_delete_tag_id=soft_delete_tag_id)
 
         try:
             await rest_patch_async(
@@ -972,9 +990,6 @@ async def run_orphan_vm_sweep(
             stream=stream,
             reason=scan_skip_reason,
         )
-    soft_delete_tag_id = (
-        await _ensure_soft_delete_tag_id(nb) if candidates and not dry_run else None
-    )
     result = await soft_delete_orphan_vms(
         nb,
         candidates,
@@ -982,7 +997,7 @@ async def run_orphan_vm_sweep(
         dry_run=dry_run,
         stream=stream,
         touched_vm_ids=touched_vm_ids,
-        soft_delete_tag_id=soft_delete_tag_id,
         live_vm_keys=live_vm_keys,
+        ensure_marker=True,
     )
     return {"enabled": enabled, "skipped_reason": None, **result}

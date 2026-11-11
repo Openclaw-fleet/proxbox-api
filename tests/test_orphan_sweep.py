@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from netbox_sdk.client import ApiResponse
 
 from proxbox_api import netbox_rest
 from proxbox_api.constants import DISCOVERY_TAG_VM_LXC, DISCOVERY_TAG_VM_QEMU
@@ -44,10 +47,12 @@ def _vm(
 
 
 @pytest.fixture(autouse=True)
-def _stale_sidecar(monkeypatch: pytest.MonkeyPatch) -> None:
+def _stale_sidecar(monkeypatch: pytest.MonkeyPatch):
     """By default the pre-PATCH sidecar re-read still shows the discovery-time stale run."""
 
-    async def _resolve(_nb: object, _vm_id: int) -> dict[str, object] | None:
+    readers = (orphan_sweep._fresh_vm_record, orphan_sweep.resolve_vm_sidecar_by_parent_id)
+
+    async def _resolve(_nb: object, _vm_id: int, **_kwargs: Any) -> dict[str, object] | None:
         return {"last_run_id": "old-run"}
 
     async def _fresh(_nb: object, record_id: int) -> dict[str, object] | None:
@@ -59,6 +64,7 @@ def _stale_sidecar(monkeypatch: pytest.MonkeyPatch) -> None:
     _FRESH_OVERRIDE.clear()
     monkeypatch.setattr(orphan_sweep, "resolve_vm_sidecar_by_parent_id", _resolve)
     monkeypatch.setattr(orphan_sweep, "_fresh_vm_record", _fresh)
+    return readers
 
 
 class _Bridge:
@@ -685,7 +691,7 @@ async def test_scan_requires_run_id_stamp_inside_endpoint_scope(
 async def test_soft_delete_skips_vm_restamped_between_discovery_and_patch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def _restamped(_nb: object, vm_id: int) -> dict[str, object] | None:
+    async def _restamped(_nb: object, vm_id: int, **_kwargs: Any) -> dict[str, object] | None:
         return {"last_run_id": "current-run" if vm_id == 1 else "old-run"}
 
     patched: list[int] = []
@@ -720,7 +726,7 @@ async def test_soft_delete_skips_vm_restamped_between_discovery_and_patch(
 async def test_soft_delete_skips_when_sidecar_unverifiable_or_changed(
     monkeypatch: pytest.MonkeyPatch, resolved: dict[str, object] | None
 ) -> None:
-    async def _resolve(_nb: object, _vm_id: int) -> dict[str, object] | None:
+    async def _resolve(_nb: object, _vm_id: int, **_kwargs: Any) -> dict[str, object] | None:
         return resolved
 
     async def _unexpected_patch(*_args: Any, **_kwargs: Any) -> dict[str, object]:
@@ -956,3 +962,144 @@ async def test_soft_delete_skips_when_fresh_vm_unreadable_or_already_swept(
 
     assert result["skipped"] == 1 and result["soft_deleted"] == 0
     assert bridge.item_progress[0]["warning"] == reason
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("planned_at_discovery", [True, False])
+async def test_retirement_preserves_planned_inventory_without_any_writes(
+    monkeypatch: pytest.MonkeyPatch, planned_at_discovery: bool
+) -> None:
+    candidate = _vm(21, "future-workload")
+    candidate["status"] = {"value": "planned" if planned_at_discovery else "active"}
+    candidate.update({"_proxmox_cluster_name": "fixture-cluster", "_proxmox_vm_type": "qemu"})
+    _FRESH_OVERRIDE[21] = {**candidate, "status": {"value": "planned"}}
+    _install_scan(
+        monkeypatch,
+        SidecarVMOrphanScan(
+            stale_candidates=[candidate], current_vm_ids={22}, run_seen_in_scope=True
+        ),
+    )
+    _forbid_writes(monkeypatch)
+    bridge = _Bridge()
+
+    result = await run_orphan_vm_sweep(
+        object(), run_id="current-run", enabled=True, stream=bridge, live_vm_keys=set()
+    )
+
+    assert result["soft_deleted"] == 0
+    assert result["skipped"] == 1
+    assert bridge.item_progress[0]["warning"] == "planned_inventory"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("moved_field", [None, "site", "cluster"])
+async def test_retirement_preserves_inventory_moved_after_discovery(
+    monkeypatch: pytest.MonkeyPatch, moved_field: str | None
+) -> None:
+    candidate = _vm(31, "moved-workload")
+    candidate.update(
+        {
+            "site": {"id": 41},
+            "cluster": {"id": 51},
+            "_proxmox_cluster_name": "fixture-cluster",
+            "_proxmox_vm_type": "qemu",
+        }
+    )
+    _FRESH_OVERRIDE[31] = {**candidate, moved_field: {"id": 61}} if moved_field else {**candidate}
+    _install_scan(
+        monkeypatch,
+        SidecarVMOrphanScan(
+            stale_candidates=[candidate], current_vm_ids={32}, run_seen_in_scope=True
+        ),
+    )
+    patches: list[dict[str, object]] = []
+
+    async def _tag(*_args: Any, **_kwargs: Any) -> dict[str, object]:
+        return {"id": 71}
+
+    async def _patch(
+        _nb: object, _path: str, _record_id: int, payload: dict[str, object]
+    ) -> dict[str, object]:
+        patches.append(payload)
+        return payload
+
+    if moved_field:
+        _forbid_writes(monkeypatch)
+    else:
+        monkeypatch.setattr(netbox_rest, "ensure_tag_async", _tag)
+        monkeypatch.setattr(orphan_sweep, "rest_patch_async", _patch)
+    bridge = _Bridge()
+
+    result = await run_orphan_vm_sweep(
+        object(), run_id="current-run", enabled=True, stream=bridge, live_vm_keys=set()
+    )
+
+    assert result["soft_deleted"] == (0 if moved_field else 1)
+    assert result["skipped"] == (1 if moved_field else 0)
+    if moved_field:
+        assert bridge.item_progress[0]["warning"] == "placement_changed"
+    else:
+        assert patches == [
+            {
+                "status": "decommissioning",
+                "tags": [{"slug": DISCOVERY_TAG_VM_QEMU}, {"id": 71}],
+            }
+        ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("changed", [None, "planned", "site", "restamped"])
+async def test_retirement_rechecks_authority_despite_warm_response_caches(
+    monkeypatch: pytest.MonkeyPatch, changed: str | None, _stale_sidecar
+) -> None:
+    # Exercise the real readers rather than the default sidecar/fresh-row fakes.
+    monkeypatch.setattr(orphan_sweep, "_fresh_vm_record", _stale_sidecar[0])
+    monkeypatch.setattr(orphan_sweep, "resolve_vm_sidecar_by_parent_id", _stale_sidecar[1])
+    candidate = _vm(31, "protected-workload")
+    candidate.update({"status": "active", "site": {"id": 41}, "cluster": {"id": 51}})
+    sidecar = {"id": 81, "virtual_machine": {"id": 31}, "last_run_id": "old-run"}
+    old_rows = {
+        orphan_sweep.VIRTUAL_MACHINES_PATH: candidate,
+        sync_state_reader.VM_SYNC_STATE_PATH: sidecar,
+    }
+    fresh_rows = {path: dict(row) for path, row in old_rows.items()}
+    if changed == "planned":
+        fresh_rows[orphan_sweep.VIRTUAL_MACHINES_PATH]["status"] = "planned"
+    elif changed == "site":
+        fresh_rows[orphan_sweep.VIRTUAL_MACHINES_PATH]["site"] = {"id": 42}
+    elif changed == "restamped":
+        fresh_rows[sync_state_reader.VM_SYNC_STATE_PATH]["last_run_id"] = "current-run"
+
+    async def cached_request(_method, path, **_kwargs):
+        return ApiResponse(
+            status=200, text=json.dumps({"count": 1, "results": [old_rows[path]], "next": None})
+        )
+
+    async def fresh_request(_method, path, **_kwargs):
+        return ApiResponse(
+            status=200, text=json.dumps({"count": 1, "results": [fresh_rows[path]], "next": None})
+        )
+
+    nb = SimpleNamespace(
+        client=SimpleNamespace(request=cached_request, request_bounded=fresh_request)
+    )
+    monkeypatch.setattr(netbox_rest, "_resolve_get_cache_ttl_seconds", lambda: 60.0)
+    for path, query in (
+        (orphan_sweep.VIRTUAL_MACHINES_PATH, {"id": 31, "limit": 2}),
+        (sync_state_reader.VM_SYNC_STATE_PATH, {"virtual_machine_id": 31, "limit": 2}),
+    ):
+        await netbox_rest.rest_list_async(nb, path, query=query)
+
+    patches = []
+
+    async def patch(_nb, _path, _record_id, payload):
+        patches.append(payload)
+        return payload
+
+    monkeypatch.setattr(orphan_sweep, "rest_patch_async", patch)
+    result = await soft_delete_orphan_vms(
+        nb, [candidate], run_id="current-run", soft_delete_tag_id=71
+    )
+    assert result["soft_deleted"] == (0 if changed else 1)
+    assert result["skipped"] == (1 if changed else 0)
+    assert len(patches) == (0 if changed else 1)

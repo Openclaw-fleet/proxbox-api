@@ -558,8 +558,26 @@ async def resolve_unique_virtual_machine_by_sync_state(
     return await _resolve_unique_vm_identity_candidate(nb, proxmox_vm_id=vmid)
 
 
-async def resolve_vm_sidecar_by_parent_id(nb: object, vm_id: int) -> dict[str, object] | None:
+async def resolve_vm_sidecar_by_parent_id(
+    nb: object, vm_id: int, *, authoritative: bool = False
+) -> dict[str, object] | None:
     """Return the VM sidecar row for a NetBox VM id, if the optional API is available."""
+    if authoritative:
+        try:
+            rows = await rest_list_async(
+                nb,
+                VM_SYNC_STATE_PATH,
+                query={"virtual_machine_id": vm_id, "limit": 2},
+                authoritative=True,
+            )
+        except Exception:
+            return None
+        if len(rows) != 1:
+            return None
+        data = _record_to_dict(rows[0])
+        if data is None or _relation_id_from_field(data, "virtual_machine") != vm_id:
+            return None
+        return data
     sidecar = await _first_sidecar(nb, query={"virtual_machine_id": vm_id})
     return _record_to_dict(sidecar) if sidecar is not None else None
 
