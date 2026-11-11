@@ -19,7 +19,12 @@ from netbox_sdk.client import ApiResponse
 from pydantic import BaseModel
 
 from proxbox_api.exception import ProxboxException
-from proxbox_api.inventory_policy import require_writable_resource, resource_is_read_only
+from proxbox_api.inventory_policy import (
+    require_writable_patch,
+    require_writable_resource,
+    resource_is_read_only,
+    writable_patch_fields,
+)
 from proxbox_api.logger import logger
 from proxbox_api.netbox_sdk_helpers import to_dict
 from proxbox_api.schemas.netbox.extras import TagSchema
@@ -943,8 +948,8 @@ class RestRecord:
         }
         if not payload:
             return self
-        require_writable_resource(self._list_path)
-        require_writable_resource(self._detail_path)
+        require_writable_patch(self._list_path, payload)
+        require_writable_patch(self._detail_path, payload)
         try:
             response = await self._api.client.request(
                 "PATCH",
@@ -1687,6 +1692,11 @@ async def _rest_reconcile_async_impl(  # noqa: C901
             for field in nullable_fields:
                 if current_payload.get(field) is not None and field not in desired_payload:
                     patch_payload[field] = None
+        owned_fields = writable_patch_fields(normalized_path)
+        if owned_fields is not None:
+            patch_payload = {
+                key: value for key, value in patch_payload.items() if key in owned_fields
+            }
         if patchable_fields is not None:
             allowed = {str(field) for field in patchable_fields}
             patch_payload = {key: value for key, value in patch_payload.items() if key in allowed}
@@ -1837,7 +1847,7 @@ async def rest_patch_async(
     semaphore = _get_netbox_semaphore()
 
     normalized_path = _normalize_path(path)
-    require_writable_resource(normalized_path)
+    require_writable_patch(normalized_path, payload)
     detail_path = _detail_path(normalized_path, record_id)
 
     async def _do_request() -> dict[str, object]:
@@ -1963,6 +1973,8 @@ async def rest_bulk_patch_async(
     semaphore = _get_netbox_semaphore()
     normalized_path = _normalize_path(path)
     require_writable_resource(normalized_path)
+    for payload in updates:
+        require_writable_patch(normalized_path, set(payload) - {"id"})
 
     async def _do_request() -> list[RestRecord]:
         try:
@@ -2309,6 +2321,13 @@ async def rest_bulk_reconcile_async(  # noqa: C901
     resolved_batch_delay_ms = _normalize_bulk_batch_delay_ms(batch_delay_ms)
     if resource_is_read_only(_normalize_path(path)):
         patchable_fields = frozenset()
+    owned_fields = writable_patch_fields(_normalize_path(path))
+    if owned_fields is not None:
+        patchable_fields = (
+            owned_fields
+            if patchable_fields is None
+            else owned_fields.intersection(patchable_fields)
+        )
 
     desired_entries: list[tuple[dict[str, object], dict[str, object]]] = []
     seen_desired: set[tuple[tuple[str, object], ...]] = set()

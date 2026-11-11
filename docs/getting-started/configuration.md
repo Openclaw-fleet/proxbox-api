@@ -131,10 +131,34 @@ instead of falling back to unrestricted writes. Unknown keys, non-list values,
 noncanonical paths and relative filenames are invalid. The file is pinned on
 first use; restart the backend after editing it.
 
+An optional `patch_fields` map limits updates to collector-owned top-level
+fields. For example, this allows only CPU and memory updates on existing VMs:
+
+```json
+{
+  "read_only_paths": ["/api/dcim/sites/"],
+  "patch_fields": {
+    "/api/virtualization/virtual-machines/": ["vcpus", "memory"]
+  }
+}
+```
+
+Single/bulk reconciliation intersects these allowlists with any caller field
+limits and leaves other fields unchanged, including nullable fields. An empty
+allowlist prevents all updates. Overlapping prefixes intersect rather than
+override. Direct patch helpers and record saves reject the entire request if
+it includes any forbidden field; bulk rejection happens before sending any
+item. Bulk `id` identifies the target and is not an updated field.
+
+Field limits do not restrict creation or deletion: combine them with resource
+ownership and NetBox permissions. They do not filter individual nested keys;
+allowing `custom_fields` allows the whole object. Omitted `patch_fields` or
+unmatched paths retain existing behavior. Invalid maps fail closed.
+
 This is a REST-collector boundary, not a replacement for NetBox permissions or
 an all-purpose SDK sandbox. Use a least-privilege NetBox token as a second
-boundary. This setting does not yet constrain VM placement or VM field
-ownership, nor does it make other synchronization stages safe to enable.
+boundary. This setting does not yet enforce VM site membership or safe
+creation/placement, nor does it make other synchronization stages safe to enable.
 
 ## Proxmox Endpoints
 

@@ -130,10 +130,35 @@ sem fallback permissivo. Chaves desconhecidas, valores que não sejam listas,
 caminhos não canônicos e nomes de arquivo relativos são inválidos. O arquivo é
 fixado no primeiro uso; reinicie o backend após editá-lo.
 
+O mapa opcional `patch_fields` limita atualizações aos campos de primeiro nível
+mantidos pelo coletor. Por exemplo, somente CPU e memória de VMs existentes:
+
+```json
+{
+  "read_only_paths": ["/api/dcim/sites/"],
+  "patch_fields": {
+    "/api/virtualization/virtual-machines/": ["vcpus", "memory"]
+  }
+}
+```
+
+A reconciliação individual/em lote cruza essas listas com os limites do
+chamador e preserva outros campos, inclusive os anuláveis. Uma lista vazia
+impede atualizações. Prefixos sobrepostos são combinados por interseção.
+Helpers de alteração direta e `save()` recusam toda a solicitação se houver
+qualquer campo proibido; lotes são recusados antes de enviar qualquer item.
+O `id` do lote identifica o alvo e não é um campo atualizado.
+
+Esses limites não restringem criação ou exclusão: combine-os com propriedade
+dos recursos e permissões NetBox. Não há filtragem de chaves aninhadas;
+permitir `custom_fields` permite o objeto inteiro. Omissão de `patch_fields`
+ou caminhos sem correspondência preservam o comportamento atual. Mapas
+inválidos bloqueiam mutações.
+
 Esse limite cobre os coletores REST, não substitui permissões NetBox nem isola
 todo uso do SDK. Use também um token NetBox com privilégios mínimos. A opção
-ainda não restringe posicionamento ou propriedade dos campos de VMs e não
-autoriza ativar outras etapas de sincronização.
+ainda não garante pertencimento a um site nem criação/posicionamento seguros
+de VMs e não autoriza ativar outras etapas de sincronização.
 
 ## Endpoints Proxmox
 
