@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 from datetime import datetime
+from ipaddress import ip_interface
 
+from proxbox_api.exception import ProxboxException
 from proxbox_api.logger import logger
-from proxbox_api.netbox_rest import rest_list_async, rest_reconcile_async
+from proxbox_api.netbox_rest import (
+    clear_rest_get_cache_for_path,
+    rest_list_async,
+    rest_reconcile_async,
+)
 from proxbox_api.proxmox_to_netbox.models import NetBoxIpAddressSyncState
 
 
@@ -55,6 +61,74 @@ def _host_address(ip_addr: str) -> str:
     return ip_addr.split("/", 1)[0]
 
 
+def _select_ip_owner(
+    existing: list,
+    *,
+    ip_addr: str,
+    assigned_object_type: str,
+    interface_id: int,
+) -> object | None:
+    """Resolve one globally unique address; uncertainty never permits a write."""
+    if not existing:
+        return None
+    if len(existing) != 1:
+        raise ProxboxException(message=f"IP ownership is ambiguous for {ip_addr}")
+    record = existing[0]
+    try:
+        if ip_interface(str(_record_field(record, "address"))).ip != ip_interface(ip_addr).ip:
+            raise ValueError("address filter did not match")
+    except ValueError as exc:
+        raise ProxboxException(message=f"IP ownership lookup is invalid for {ip_addr}") from exc
+    missing = object()
+    assigned_type = _record_field(record, "assigned_object_type", missing)
+    raw_id = _record_field(record, "assigned_object_id", missing)
+    assigned_id = _relation_id_or_none(raw_id)
+    own = assigned_type == assigned_object_type and assigned_id == interface_id
+    free = assigned_type in (None, "") and raw_id is None
+    if not (own or free) or _relation_id_or_none(_record_field(record, "id")) is None:
+        raise ProxboxException(message=f"IP ownership conflict for {ip_addr}")
+    return record
+
+
+async def _preflight_vm_ip_payloads(nb: object, payloads: list[dict]) -> None:
+    """Validate the complete batch before its first write, across object types.
+
+    Bulk sync never changes assignment or masks. A free or differently masked
+    existing address must therefore use targeted sync, not a duplicate create.
+    """
+    clear_rest_get_cache_for_path(nb, "/api/ipam/ip-addresses/")
+    records = await rest_list_async(nb, "/api/ipam/ip-addresses/")
+    by_host: dict[str, list] = {}
+    for record in records:
+        host = str(ip_interface(str(_record_field(record, "address"))).ip)
+        by_host.setdefault(host, []).append(record)
+    desired: dict[str, tuple[int, str]] = {}
+    for payload in payloads:
+        address = str(payload["address"])
+        host = str(ip_interface(address).ip)
+        interface_id = int(payload["assigned_object_id"])
+        claim = (interface_id, str(ip_interface(address)))
+        if payload.get("assigned_object_type") != "virtualization.vminterface":
+            raise ProxboxException(message=f"IP ownership target is invalid for {address}")
+        if host in desired and desired[host] != claim:
+            raise ProxboxException(message=f"IP ownership has conflicting batch claims for {host}")
+        desired[host] = claim
+        target = _select_ip_owner(
+            by_host.get(host, []),
+            ip_addr=address,
+            assigned_object_type="virtualization.vminterface",
+            interface_id=interface_id,
+        )
+        if target is not None and (
+            _record_field(target, "assigned_object_type") != "virtualization.vminterface"
+            or _relation_id_or_none(_record_field(target, "assigned_object_id")) != interface_id
+            or str(ip_interface(str(_record_field(target, "address")))) != claim[1]
+        ):
+            raise ProxboxException(
+                message=f"IP ownership for {address} requires targeted sync before bulk sync",
+            )
+
+
 async def _reconcile_interface_ip(
     nb,
     *,
@@ -75,7 +149,8 @@ async def _reconcile_interface_ip(
     * adopt a record that is currently unassigned, or
     * create a new record scoped to this interface.
 
-    A record assigned to a different object is never reused or reassigned.
+    A foreign, duplicate, malformed, or unreadable address fails closed rather
+    than creating a second record. This fork enforces global host uniqueness.
     """
     interface_id = int(interface_id)
     payload = {
@@ -88,34 +163,24 @@ async def _reconcile_interface_ip(
     }
 
     try:
+        clear_rest_get_cache_for_path(nb, "/api/ipam/ip-addresses/")
         existing = await rest_list_async(
             nb,
             "/api/ipam/ip-addresses/",
             query={"address": _host_address(ip_addr), "limit": 50},
         )
     except Exception as list_exc:
-        # If ownership cannot be resolved, fall back to the interface-scoped
-        # create path below (which still never matches a foreign address)
-        # rather than aborting the whole IP sync.
-        logger.debug(
-            "Ownership lookup for IP %s failed (%s); using interface-scoped create",
-            ip_addr,
-            list_exc,
-        )
-        existing = []
+        raise ProxboxException(
+            message=f"IP ownership lookup failed for {ip_addr}",
+            http_status_code=502,
+        ) from list_exc
 
-    own_record: object | None = None
-    adoptable_record: object | None = None
-    for record in existing or []:
-        assigned_type = _record_field(record, "assigned_object_type")
-        assigned_id = _relation_id_or_none(_record_field(record, "assigned_object_id"))
-        if assigned_type == assigned_object_type and assigned_id == interface_id:
-            own_record = record
-            break
-        if adoptable_record is None and assigned_type in (None, "") and assigned_id is None:
-            adoptable_record = record
-
-    target = own_record or adoptable_record
+    target = _select_ip_owner(
+        existing,
+        ip_addr=ip_addr,
+        assigned_object_type=assigned_object_type,
+        interface_id=interface_id,
+    )
     try:
         record_id = (
             _relation_id_or_none(_record_field(target, "id")) if target is not None else None

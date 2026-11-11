@@ -4,8 +4,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 
-from proxbox_api.netbox_rest import rest_first_async, rest_list_async, rest_reconcile_async
-from proxbox_api.proxmox_to_netbox.models import NetBoxIpAddressSyncState
+from proxbox_api.exception import ProxboxException
+from proxbox_api.netbox_rest import rest_first_async, rest_list_async
 from proxbox_api.services.proxmox_helpers import (
     get_qemu_guest_agent_hostname,
     get_qemu_guest_agent_network_interfaces,
@@ -15,7 +15,6 @@ from proxbox_api.services.proxmox_helpers import (
 )
 from proxbox_api.services.sync.individual.base import BaseIndividualSyncService
 from proxbox_api.services.sync.individual.helpers import (
-    build_ip_lookup_key,
     build_sync_response,
     ensure_vm_record,
     extract_net_interface_config,
@@ -383,26 +382,8 @@ async def sync_ip_individual(
                 else None
             )
         else:
-            ip_payload: dict[str, object] = {
-                "address": ip_address,
-                "status": "active",
-                "dns_name": dns_name or "",
-                "tags": tag_refs,
-            }
-            ip_record = await rest_reconcile_async(
-                nb,
-                "/api/ipam/ip-addresses/",
-                lookup=build_ip_lookup_key(ip_address),
-                payload=ip_payload,
-                schema=NetBoxIpAddressSyncState,
-                current_normalizer=lambda record: {
-                    "address": record.get("address"),
-                    "assigned_object_type": record.get("assigned_object_type"),
-                    "assigned_object_id": record.get("assigned_object_id"),
-                    "status": record.get("status"),
-                    "dns_name": record.get("dns_name"),
-                    "tags": record.get("tags"),
-                },
+            raise ProxboxException(
+                message="IP ownership cannot be established without a target interface",
             )
 
         netbox_object = (

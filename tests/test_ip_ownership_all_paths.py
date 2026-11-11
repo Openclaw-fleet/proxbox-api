@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from proxbox_api.exception import ProxboxException
 from proxbox_api.services.sync.individual.ip_sync import sync_ip_individual
 from proxbox_api.services.sync.network import (
     bulk_reconcile_vm_interface_ips,
@@ -91,10 +92,14 @@ def _own_dcim_ip() -> dict[str, Any]:
 
 
 @pytest.mark.asyncio
-async def test_bulk_vm_interface_ips_foreign_address_creates_scoped_record(
+@pytest.mark.parametrize(
+    "case", ["foreign_vm", "foreign_dcim", "duplicate", "free", "mask", "lookup", "claims"]
+)
+async def test_bulk_vm_interface_ips_foreign_address_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
+    case: str,
 ) -> None:
-    """A foreign VM-interface IP must not suppress creation for this interface."""
+    """A foreign VM-interface IP prevents every IP write in the batch."""
     created: list[dict[str, Any]] = []
     patched: list[dict[str, Any]] = []
     captured_base_query: list[dict[str, object] | None] = []
@@ -118,26 +123,45 @@ async def test_bulk_vm_interface_ips_foreign_address_creates_scoped_record(
     monkeypatch.setattr("proxbox_api.netbox_rest.rest_bulk_create_async", _fake_bulk_create)
     monkeypatch.setattr("proxbox_api.netbox_rest.rest_bulk_patch_async", _fake_bulk_patch)
 
-    records = await bulk_reconcile_vm_interface_ips(
-        nb=object(),
-        ip_payloads=[
-            {
-                "address": _ADDR,
-                "assigned_object_type": "virtualization.vminterface",
-                "assigned_object_id": 111,
-                "status": "active",
-                "dns_name": "",
-                "tags": [],
-            }
-        ],
-    )
+    async def _fake_global_list(*args, **kwargs):
+        if case == "lookup":
+            raise TimeoutError("synthetic NetBox failure")
+        return {
+            "foreign_vm": [_foreign_vm_ip()],
+            "foreign_dcim": [{**_foreign_dcim_ip(), "assigned_object_id": 111}],
+            "duplicate": [_own_vm_ip(), _foreign_vm_ip()],
+            "free": [_unassigned_ip()],
+            "mask": [{**_own_vm_ip(), "address": _ADDR.replace("/24", "/32")}],
+            "claims": [],
+        }[case]
 
-    assert captured_base_query == [{"assigned_object_type": "virtualization.vminterface"}]
+    monkeypatch.setattr("proxbox_api.services.sync.ip_ownership.rest_list_async", _fake_global_list)
+
+    # A safe new address precedes the bad claim: validation must complete
+    # before the first batch write, not fail after partially creating records.
+    payloads = [
+        {
+            "address": "192.0.2.41/24",
+            "assigned_object_type": "virtualization.vminterface",
+            "assigned_object_id": 111,
+        },
+        {
+            "address": _ADDR,
+            "assigned_object_type": "virtualization.vminterface",
+            "assigned_object_id": 111,
+        },
+    ]
+    if case == "claims":
+        payloads.append({**payloads[-1], "assigned_object_id": 222})
+    with pytest.raises((ProxboxException, TimeoutError)):
+        await bulk_reconcile_vm_interface_ips(
+            nb=object(),
+            ip_payloads=payloads,
+        )
+
+    assert captured_base_query == []
     assert patched == []
-    assert len(created) == 1
-    assert created[0]["address"] == _ADDR
-    assert created[0]["assigned_object_id"] == 111
-    assert records[0].id == 700
+    assert created == []
 
 
 @pytest.mark.asyncio
@@ -164,6 +188,11 @@ async def test_bulk_vm_interface_ips_reuses_own_record(monkeypatch: pytest.Monke
     monkeypatch.setattr("proxbox_api.netbox_rest.rest_bulk_create_async", _fake_bulk_create)
     monkeypatch.setattr("proxbox_api.netbox_rest.rest_bulk_patch_async", _fake_bulk_patch)
 
+    async def _fake_global_list(*args, **kwargs):
+        return [_Record(**_own_vm_ip())]
+
+    monkeypatch.setattr("proxbox_api.services.sync.ip_ownership.rest_list_async", _fake_global_list)
+
     records = await bulk_reconcile_vm_interface_ips(
         nb=object(),
         ip_payloads=[
@@ -186,14 +215,17 @@ async def test_bulk_vm_interface_ips_reuses_own_record(monkeypatch: pytest.Monke
 async def _run_individual_ip_path(
     monkeypatch: pytest.MonkeyPatch,
     existing_for_address: list[dict[str, Any]],
+    *,
+    expect_error: bool = False,
+    interface_id: int | None = 111,
 ) -> list[dict[str, Any]]:
     reconcile_calls: list[dict[str, Any]] = []
 
     async def _fake_ensure_vm_record(*_args: Any, **_kwargs: Any):
         return {"id": 55, "name": "vm01"}, None
 
-    async def _fake_resolve_interface_id(*_args: Any, **_kwargs: Any) -> int:
-        return 111
+    async def _fake_resolve_interface_id(*_args: Any, **_kwargs: Any) -> int | None:
+        return interface_id
 
     async def _fake_rest_list(_nb: object, path: str, query=None):
         if path == "/api/ipam/ip-addresses/":
@@ -254,20 +286,28 @@ async def _run_individual_ip_path(
         interface_name="eth0",
     )
 
-    assert result["error"] is None
+    if expect_error:
+        assert "ownership" in result["error"]
+        assert result["action"] == "error"
+    else:
+        assert result["error"] is None
     return reconcile_calls
 
 
 @pytest.mark.asyncio
-async def test_individual_ip_foreign_address_creates_scoped_record(
+@pytest.mark.parametrize("interface_id", [111, None])
+async def test_individual_ip_foreign_address_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
+    interface_id: int | None,
 ) -> None:
-    calls = await _run_individual_ip_path(monkeypatch, [_foreign_vm_ip()])
+    calls = await _run_individual_ip_path(
+        monkeypatch,
+        [_foreign_vm_ip()],
+        expect_error=True,
+        interface_id=interface_id,
+    )
 
-    assert len(calls) == 1
-    assert calls[0]["lookup"] == {"address": _ADDR, "vminterface_id": 111}
-    assert calls[0]["kwargs"].get("strict_lookup") is True
-    assert calls[0]["payload"]["assigned_object_id"] == 111
+    assert calls == []
 
 
 @pytest.mark.asyncio
@@ -332,17 +372,13 @@ async def _run_node_ip_path(
 
 
 @pytest.mark.asyncio
-async def test_node_interface_ip_foreign_address_creates_scoped_record(
+async def test_node_interface_ip_foreign_address_fails_closed(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     result, calls = await _run_node_ip_path(monkeypatch, [_foreign_dcim_ip()])
 
-    assert result["ip_id"] == 702
-    assert len(calls) == 1
-    assert calls[0]["lookup"] == {"address": _ADDR, "interface_id": 222}
-    assert calls[0]["kwargs"].get("strict_lookup") is True
-    assert calls[0]["payload"]["assigned_object_type"] == "dcim.interface"
-    assert calls[0]["payload"]["assigned_object_id"] == 222
+    assert result.get("ip_id") is None
+    assert calls == []
 
 
 @pytest.mark.asyncio

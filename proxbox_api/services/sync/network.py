@@ -33,6 +33,7 @@ from proxbox_api.services.sync.guest_vm_interface import (
 )
 from proxbox_api.services.sync.ip_ownership import (
     _ip_address_current_normalizer,
+    _preflight_vm_ip_payloads,
     _reconcile_interface_ip,
 )
 from proxbox_api.services.sync.stage_result import attach_skips_to_list
@@ -1399,6 +1400,10 @@ async def bulk_reconcile_vm_interface_ips(
     """
     if not ip_payloads:
         return []
+
+    # Validate every claim before any write. The bulk lookup below is scoped to
+    # VM interfaces and cannot itself detect DCIM owners or mask differences.
+    await _preflight_vm_ip_payloads(nb, ip_payloads)
 
     # Never patch assignment fields on existing IPs.  NetBox rejects
     # reassignment when the IP is the primary IP of the parent object
