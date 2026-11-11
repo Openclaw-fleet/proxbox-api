@@ -18,7 +18,8 @@ from proxbox_api.services.sync import ip_ownership
 def _mocks(monkeypatch, existing):
     captured = {"list_query": None, "reconcile": []}
 
-    async def fake_list(nb, path, *, query=None):
+    async def fake_list(nb, path, *, query=None, authoritative=False):
+        assert authoritative
         captured["list_query"] = query
         return existing
 

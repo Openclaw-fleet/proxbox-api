@@ -32,6 +32,7 @@ from proxbox_api.services.sync.guest_vm_interface import (
     should_use_guest_agent_core_interface_name,
 )
 from proxbox_api.services.sync.ip_ownership import (
+    IP_OWNERSHIP_QUERY_BATCH_SIZE,
     _ip_address_current_normalizer,
     _preflight_vm_ip_payloads,
     _reconcile_interface_ip,
@@ -1403,7 +1404,7 @@ async def bulk_reconcile_vm_interface_ips(
 
     # Validate every claim before any write. The bulk lookup below is scoped to
     # VM interfaces and cannot itself detect DCIM owners or mask differences.
-    await _preflight_vm_ip_payloads(nb, ip_payloads)
+    ip_payloads = await _preflight_vm_ip_payloads(nb, ip_payloads)
 
     # Never patch assignment fields on existing IPs.  NetBox rejects
     # reassignment when the IP is the primary IP of the parent object
@@ -1423,22 +1424,36 @@ async def bulk_reconcile_vm_interface_ips(
             gated.add("dns_name")
         patchable_fields = frozenset(gated)
 
-    result = None
+    records = []
+    hosts = list(
+        dict.fromkeys(str(_ip_interface(payload["address"]).ip) for payload in ip_payloads)
+    )
     try:
-        result = await rest_bulk_reconcile_async(
-            nb,
-            "/api/ipam/ip-addresses/",
-            payloads=ip_payloads,
-            lookup_fields=["address", "assigned_object_id"],
-            schema=NetBoxIpAddressSyncState,
-            current_normalizer=_ip_address_current_normalizer,
-            patchable_fields=patchable_fields,
-            base_query={"assigned_object_type": "virtualization.vminterface"},
-        )
-        return result.records if result and hasattr(result, "records") else []
+        for offset in range(0, len(hosts), IP_OWNERSHIP_QUERY_BATCH_SIZE):
+            batch = hosts[offset : offset + IP_OWNERSHIP_QUERY_BATCH_SIZE]
+            result = await rest_bulk_reconcile_async(
+                nb,
+                "/api/ipam/ip-addresses/",
+                payloads=[p for p in ip_payloads if str(_ip_interface(p["address"]).ip) in batch],
+                lookup_fields=["address", "assigned_object_id"],
+                schema=NetBoxIpAddressSyncState,
+                current_normalizer=_ip_address_current_normalizer,
+                patchable_fields=patchable_fields,
+                base_query={"assigned_object_type": "virtualization.vminterface", "address": batch},
+                authoritative_lookup=True,
+            )
+            if result.failed:
+                raise ProxboxException(
+                    message="Bulk VM IP reconciliation is incomplete", http_status_code=502
+                )
+            records.extend(result.records)
+        return records
+    except ProxboxException:
+        raise
     except Exception as e:
-        logger.error("Error during bulk VM interface IP reconciliation: %s", e)
-        return []
+        raise ProxboxException(
+            message="Bulk VM IP reconciliation failed", http_status_code=502
+        ) from e
 
 
 async def cleanup_stale_ips_for_interface(

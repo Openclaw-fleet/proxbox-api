@@ -1550,6 +1550,38 @@ def _install_ip_only_patches(monkeypatch, *, vm_config: dict, primary_ip_calls: 
     )
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_rejected_ip_batch_stops_primary_assignment_and_surfaces_failure(monkeypatch, stream):
+    data = _vm_sync_inputs({"net0": "virtio=AA:BB:CC:DD:EE:FF,ip=192.0.2.25/24"})
+    primary_ip_calls: list = []
+    _install_ip_only_patches(
+        monkeypatch, vm_config=data["vm_config"], primary_ip_calls=primary_ip_calls
+    )
+
+    async def _reject(*_args, **_kwargs):
+        raise ProxboxException(message="IP ownership has conflicting batch claims")
+
+    async def _send(_message):
+        pass
+
+    monkeypatch.setattr(
+        "proxbox_api.services.sync.network.bulk_reconcile_vm_interface_ips", _reject
+    )
+    with pytest.raises(ProxboxException, match="conflicting batch claims"):
+        asyncio.run(
+            create_only_vm_ip_addresses(
+                netbox_session=data["netbox_session"],
+                pxs=data["pxs"],
+                cluster_status=data["cluster_status"],
+                cluster_resources=data["cluster_resources"],
+                tag=data["tag"],
+                use_websocket=stream,
+                websocket=SimpleNamespace(send_json=_send) if stream else None,
+            )
+        )
+    assert primary_ip_calls == []
+
+
 def test_agent_kv_flag_disabled_skips_guest_agent_fetch(monkeypatch):
     """agent='0,fstrim_cloned_disks=1' must NOT trigger guest-agent fetch (closes #491)."""
     data = _vm_sync_inputs(

@@ -41,6 +41,7 @@ ReconcileStatus = Literal["created", "updated", "unchanged"]
 # ``next`` chain consuming unbounded network requests or process memory.
 NETBOX_REST_LIST_HARD_MAX_PAGES = 10_000
 NETBOX_REST_LIST_HARD_MAX_RECORDS = 1_000_000
+NETBOX_REST_AUTHORITATIVE_MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True, slots=True)
@@ -1113,6 +1114,7 @@ async def _rest_list_traverse_async(
     query: dict[str, object] | None = None,
     max_records: int | None = None,
     max_offset: int | None = None,
+    authoritative: bool = False,
 ) -> list[RestRecord]:
     """Traverse one NetBox list safely, optionally stopping at a caller bound."""
 
@@ -1134,7 +1136,7 @@ async def _rest_list_traverse_async(
         )
 
     cache_generation = _get_cache_generation(api)
-    cached = _read_get_cache(api, normalized_path, query)
+    cached = None if authoritative else _read_get_cache(api, normalized_path, query)
     if cached is not None:
         if max_records is not None and len(cached) > max_records:
             raise _pagination_protocol_error(
@@ -1159,7 +1161,15 @@ async def _rest_list_traverse_async(
             int | None,
         ]:
             try:
-                response = await api.client.request("GET", page_path, query=page_query)
+                if authoritative:
+                    response = await api.client.request_bounded(
+                        "GET",
+                        page_path,
+                        query=page_query,
+                        max_response_bytes=NETBOX_REST_AUTHORITATIVE_MAX_RESPONSE_BYTES,
+                    )
+                else:
+                    response = await api.client.request("GET", page_path, query=page_query)
             except Exception as e:
                 _handle_netbox_error(e, f"list {path}")
                 raise
@@ -1390,7 +1400,7 @@ async def _rest_list_traverse_async(
         current_path, current_query = normalized_path, next_query
         current_offset = next_offset
 
-    if exhausted and _get_cache_generation(api) == cache_generation:
+    if not authoritative and exhausted and _get_cache_generation(api) == cache_generation:
         # A concurrent write invalidated this path while pages were in flight;
         # caching the pre-write snapshot would serve stale rows.
         _write_get_cache(api, normalized_path, query, aggregated)
@@ -1402,10 +1412,15 @@ async def rest_list_async(
     path: str,
     *,
     query: dict[str, object] | None = None,
+    authoritative: bool = False,
 ) -> list[RestRecord]:
-    """Return an exhaustively traversed NetBox list within hard safety bounds."""
+    """Return an exhaustive list; authoritative reads bypass both response caches.
 
-    return await _rest_list_traverse_async(nb, path, query=query)
+    Authoritative reads require the SDK's bounded, uncached, non-redirecting
+    transport. A transport failure never falls back to cached ownership data.
+    """
+
+    return await _rest_list_traverse_async(nb, path, query=query, authoritative=authoritative)
 
 
 async def rest_first_async(
@@ -2215,6 +2230,7 @@ async def rest_list_paginated_async(
     base_query: dict[str, object] | None = None,
     page_size: int = 200,
     max_offset: int | None = None,
+    authoritative: bool = False,
 ) -> list[RestRecord]:
     """Traverse a list while enforcing an optional offset/record ceiling.
 
@@ -2250,6 +2266,7 @@ async def rest_list_paginated_async(
         query=query,
         max_records=max_records,
         max_offset=resolved_max_offset,
+        authoritative=authoritative,
     )
 
 
@@ -2270,6 +2287,7 @@ async def rest_bulk_reconcile_async(  # noqa: C901
     strict_lookup: bool = False,
     nullable_fields: set[str] | frozenset[str] | None = None,
     fallback_to_individual: bool = True,
+    authoritative_lookup: bool = False,
 ) -> BulkReconcileResult:
     if not payloads:
         return BulkReconcileResult(records=[], created=0, updated=0, unchanged=0, failed=0)
@@ -2300,7 +2318,12 @@ async def rest_bulk_reconcile_async(  # noqa: C901
         seen_desired.add(lookup_key)
         desired_entries.append((desired_payload, lookup))
 
-    existing_records = await rest_list_paginated_async(nb, path, base_query=base_query)
+    if authoritative_lookup:
+        existing_records = await rest_list_paginated_async(
+            nb, path, base_query=base_query, authoritative=True
+        )
+    else:
+        existing_records = await rest_list_paginated_async(nb, path, base_query=base_query)
     existing_groups: dict[tuple[tuple[str, object], ...], list[RestRecord]] = {}
     for record in existing_records:
         try:

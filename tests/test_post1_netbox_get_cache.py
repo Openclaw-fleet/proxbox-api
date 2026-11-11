@@ -145,6 +145,36 @@ async def test_unraced_traversal_still_caches():
     assert api.gets == 1
 
 
+@pytest.mark.parametrize("reader", [rest_list_async, netbox_rest.rest_list_paginated_async])
+@pytest.mark.parametrize("fresh_read_fails", [False, True])
+async def test_authoritative_lists_bypass_both_caches_without_stale_fallback(
+    monkeypatch, reader, fresh_read_fails
+):
+    api = _Api([{"id": 1}])
+    old_response = await api._request("GET", PATH)
+
+    async def _cached_transport(*_args, **_kwargs):
+        return old_response
+
+    async def _fresh_transport(method, path, **_kwargs):
+        if fresh_read_fails:
+            raise TimeoutError("fresh ownership unavailable")
+        return await api._request(method, path)
+
+    api.client.request = _cached_transport
+    api.client.request_bounded = _fresh_transport
+    monkeypatch.setattr(netbox_rest, "_resolve_netbox_max_retries", lambda: 1)
+    assert _ids(await reader(api, PATH)) == [1]
+    api.rows = [{"id": 2}]
+    if fresh_read_fails:
+        with pytest.raises(netbox_rest.ProxboxException):
+            await reader(api, PATH, authoritative=True)
+    else:
+        assert _ids(await reader(api, PATH, authoritative=True)) == [2]
+    # Ordinary callers retain their existing cached-read contract.
+    assert _ids(await reader(api, PATH)) == [1]
+
+
 async def test_nested_mutation_does_not_corrupt_cache():
     api = _Api([{"id": 1, "custom_fields": {"a": 1}, "tags": [{"slug": "t"}]}])
     first = await rest_list_async(api, PATH)

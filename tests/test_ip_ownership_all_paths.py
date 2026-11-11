@@ -153,11 +153,14 @@ async def test_bulk_vm_interface_ips_foreign_address_fails_closed(
     ]
     if case == "claims":
         payloads.append({**payloads[-1], "assigned_object_id": 222})
-    with pytest.raises((ProxboxException, TimeoutError)):
+    with pytest.raises(ProxboxException) as error:
         await bulk_reconcile_vm_interface_ips(
             nb=object(),
             ip_payloads=payloads,
         )
+    if case == "lookup":
+        assert error.value.http_status_code == 502
+        assert isinstance(error.value.__cause__, TimeoutError)
 
     assert captured_base_query == []
     assert patched == []
@@ -165,13 +168,24 @@ async def test_bulk_vm_interface_ips_foreign_address_fails_closed(
 
 
 @pytest.mark.asyncio
-async def test_bulk_vm_interface_ips_reuses_own_record(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("stored_address", "desired_address"),
+    [
+        (_ADDR, _ADDR),
+        (_ADDR, "10.0.0.50/255.255.255.0"),
+        ("2001:db8::50/64", "2001:0db8:0:0:0:0:0:50/64"),
+    ],
+)
+async def test_bulk_vm_interface_ips_reuses_own_record(
+    monkeypatch: pytest.MonkeyPatch, stored_address: str, desired_address: str
+) -> None:
     created: list[dict[str, Any]] = []
     patched: list[dict[str, Any]] = []
+    existing = {**_own_vm_ip(), "address": stored_address}
 
     async def _fake_list_paginated(_nb: object, _path: str, *, base_query=None, **_kwargs):
-        assert base_query == {"assigned_object_type": "virtualization.vminterface"}
-        return [_Record(**_own_vm_ip())]
+        assert base_query.get("assigned_object_type") == "virtualization.vminterface"
+        return [_Record(**existing)]
 
     async def _fake_bulk_create(_nb: object, _path: str, entries: list[dict[str, Any]]):
         created.extend(entries)
@@ -189,7 +203,10 @@ async def test_bulk_vm_interface_ips_reuses_own_record(monkeypatch: pytest.Monke
     monkeypatch.setattr("proxbox_api.netbox_rest.rest_bulk_patch_async", _fake_bulk_patch)
 
     async def _fake_global_list(*args, **kwargs):
-        return [_Record(**_own_vm_ip())]
+        # A large inventory must not force a global traversal for one host.
+        if not (kwargs.get("query") or {}).get("address"):
+            raise TimeoutError("unscoped inventory exceeds the traversal budget")
+        return [_Record(**existing)]
 
     monkeypatch.setattr("proxbox_api.services.sync.ip_ownership.rest_list_async", _fake_global_list)
 
@@ -197,7 +214,7 @@ async def test_bulk_vm_interface_ips_reuses_own_record(monkeypatch: pytest.Monke
         nb=object(),
         ip_payloads=[
             {
-                "address": _ADDR,
+                "address": desired_address,
                 "assigned_object_type": "virtualization.vminterface",
                 "assigned_object_id": 111,
                 "status": "active",
@@ -210,6 +227,44 @@ async def test_bulk_vm_interface_ips_reuses_own_record(monkeypatch: pytest.Monke
     assert created == []
     assert patched == []
     assert records[0].id == 600
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("field", "invalid_id", "interface_id"),
+    [
+        ("id", True, 111),
+        ("id", 600.9, 111),
+        ("id", 0, 111),
+        ("assigned_object_id", True, 1),
+        ("assigned_object_id", 111.9, 111),
+    ],
+)
+async def test_bulk_vm_interface_ips_rejects_malformed_ownership_ids(
+    monkeypatch: pytest.MonkeyPatch, field: str, invalid_id: object, interface_id: int
+) -> None:
+    record = {**_own_vm_ip(), "assigned_object_id": interface_id, field: invalid_id}
+
+    async def _list(*_args: Any, **_kwargs: Any) -> list[dict]:
+        return [record]
+
+    async def _bulk(*_args: Any, **_kwargs: Any) -> SimpleNamespace:
+        return SimpleNamespace(records=[record])
+
+    monkeypatch.setattr("proxbox_api.services.sync.ip_ownership.rest_list_async", _list)
+    monkeypatch.setattr("proxbox_api.services.sync.network.rest_bulk_reconcile_async", _bulk)
+
+    with pytest.raises(ProxboxException, match="ownership"):
+        await bulk_reconcile_vm_interface_ips(
+            object(),
+            [
+                {
+                    "address": _ADDR,
+                    "assigned_object_type": "virtualization.vminterface",
+                    "assigned_object_id": interface_id,
+                }
+            ],
+        )
 
 
 async def _run_individual_ip_path(
@@ -227,7 +282,7 @@ async def _run_individual_ip_path(
     async def _fake_resolve_interface_id(*_args: Any, **_kwargs: Any) -> int | None:
         return interface_id
 
-    async def _fake_rest_list(_nb: object, path: str, query=None):
+    async def _fake_rest_list(_nb: object, path: str, query=None, authoritative=False):
         if path == "/api/ipam/ip-addresses/":
             return list(existing_for_address)
         return []
@@ -341,7 +396,7 @@ async def _run_node_ip_path(
             return {"id": 222, **payload}
         raise AssertionError(f"unexpected network reconcile path: {path}")
 
-    async def _fake_rest_list(_nb: object, path: str, query=None):
+    async def _fake_rest_list(_nb: object, path: str, query=None, authoritative=False):
         if path == "/api/ipam/ip-addresses/":
             return list(existing_for_address)
         return []

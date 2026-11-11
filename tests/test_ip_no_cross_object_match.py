@@ -26,7 +26,7 @@ def _run_resolve(monkeypatch, existing_for_address):
     """Drive _resolve_vm_interface_ips with a fake NetBox and capture reconcile calls."""
     reconcile_calls: list[dict] = []
 
-    async def _fake_rest_list(nb, path, query=None):
+    async def _fake_rest_list(nb, path, query=None, authoritative=False):
         query = query or {}
         # Address ownership lookup performed by _reconcile_interface_ip. The
         # lookup is mask-agnostic (queries by host) so a differently-masked
@@ -37,6 +37,7 @@ def _run_resolve(monkeypatch, existing_for_address):
             and "vminterface_id" not in query
             and "tag" not in query
         ):
+            assert authoritative
             return list(existing_for_address)
         # cleanup_stale_ips_for_interface (vminterface_id + tag) -> nothing stale.
         return []
