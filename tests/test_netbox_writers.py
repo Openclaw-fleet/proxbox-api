@@ -282,7 +282,18 @@ async def test_inventory_policy_preserves_prebound_supporting_objects(
         "record_delete",
     ],
 )
-async def test_inventory_policy_denies_direct_mutations(operation, monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/dcim/sites/",
+        "/api//dcim/sites/",
+        "/api/dcim/../dcim/sites/",
+        "/api/%64cim/sites/",
+        "/api/dcim/site%73/",
+        "/api/dcim/%2e%2e/dcim/sites/",
+    ],
+)
+async def test_inventory_policy_denies_direct_mutations(operation, path, monkeypatch, tmp_path):
     import json
 
     from proxbox_api.exception import ProxboxException
@@ -291,7 +302,6 @@ async def test_inventory_policy_denies_direct_mutations(operation, monkeypatch, 
     policy.write_text(json.dumps({"read_only_paths": ["/api/dcim/sites/"]}))
     monkeypatch.setenv("PROXBOX_INVENTORY_POLICY_FILE", str(policy))
     api = object()
-    path = "/api/dcim/sites/"
     row = netbox_rest.RestRecord(api, path, {"id": 42, "name": "Operator site"})
     row.name = "Source site"
     calls = {

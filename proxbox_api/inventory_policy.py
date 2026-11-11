@@ -8,6 +8,8 @@ import re
 from functools import lru_cache
 from pathlib import Path
 
+from netbox_sdk.client import normalize_request_path
+
 from proxbox_api.exception import ProxboxException
 
 
@@ -45,6 +47,7 @@ def resource_is_read_only(path: str) -> bool:
     filename = os.environ.get("PROXBOX_INVENTORY_POLICY_FILE")
     if filename is None:
         return False
+    path = normalize_request_path(path)
     return any(path.startswith(prefix) for prefix in _read_policy_file(filename))
 
 
