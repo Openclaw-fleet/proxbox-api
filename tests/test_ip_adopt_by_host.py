@@ -9,13 +9,17 @@ normalized), while still never reassigning a foreign-owned address.
 
 from types import SimpleNamespace
 
+import pytest
+
+from proxbox_api.exception import ProxboxException
 from proxbox_api.services.sync import ip_ownership
 
 
 def _mocks(monkeypatch, existing):
     captured = {"list_query": None, "reconcile": []}
 
-    async def fake_list(nb, path, *, query=None):
+    async def fake_list(nb, path, *, query=None, authoritative=False):
+        assert authoritative
         captured["list_query"] = query
         return existing
 
@@ -78,17 +82,55 @@ async def test_never_adopts_foreign_owned_address(monkeypatch):
     ]
     cap = _mocks(monkeypatch, existing)
 
-    await ip_ownership._reconcile_interface_ip(
-        object(),
-        ip_addr="141.94.139.106/24",
-        interface_id=5,
-        tag_refs=[],
-        now=datetime(2026, 1, 1, tzinfo=timezone.utc),
-        dns_name=None,
-        interface_name="vmbr0",
-        assigned_object_type="dcim.interface",
-        interface_lookup_field="interface_id",
-    )
+    with pytest.raises(ProxboxException, match="ownership"):
+        await ip_ownership._reconcile_interface_ip(
+            object(),
+            ip_addr="141.94.139.106/24",
+            interface_id=5,
+            tag_refs=[],
+            now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            dns_name=None,
+            interface_name="vmbr0",
+            assigned_object_type="dcim.interface",
+            interface_lookup_field="interface_id",
+        )
 
-    # Falls through to the interface-scoped create path (never reconciles id=7).
-    assert all(c["lookup"] != {"id": 7} for c in cap["reconcile"])
+    assert cap["reconcile"] == []
+
+
+@pytest.mark.parametrize("failure", ["lookup", "duplicate", "malformed", "foreign_type"])
+async def test_uncertain_ip_ownership_performs_no_writes(monkeypatch, failure):
+    from datetime import datetime, timezone
+
+    own = {
+        "id": 8,
+        "address": "192.0.2.31/24",
+        "assigned_object_type": "virtualization.vminterface",
+        "assigned_object_id": 5,
+    }
+    existing = [own]
+    if failure == "duplicate":
+        existing.append({**own, "id": 9, "assigned_object_id": 71})
+    elif failure == "malformed":
+        existing = [{"id": 8, "address": "192.0.2.31/24"}]
+    elif failure == "foreign_type":
+        existing = [{**own, "assigned_object_type": "dcim.interface"}]
+    cap = _mocks(monkeypatch, existing)
+    if failure == "lookup":
+
+        async def unavailable(*args, **kwargs):
+            raise TimeoutError("synthetic lookup failure")
+
+        monkeypatch.setattr(ip_ownership, "rest_list_async", unavailable)
+
+    with pytest.raises(ProxboxException, match="ownership"):
+        await ip_ownership._reconcile_interface_ip(
+            object(),
+            ip_addr="192.0.2.31/24",
+            interface_id=5,
+            tag_refs=[],
+            now=datetime(2026, 1, 1, tzinfo=timezone.utc),
+            dns_name=None,
+            interface_name="net0",
+        )
+    assert cap["reconcile"] == []

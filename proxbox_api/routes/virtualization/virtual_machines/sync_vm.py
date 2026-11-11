@@ -6649,8 +6649,13 @@ async def create_only_vm_ip_addresses(  # noqa: C901
                         cleanup_exc,
                     )
 
+        except ProxboxException:
+            # Stop before cleanup or primary-IP helpers can write after a rejected batch.
+            raise
         except Exception as e:
-            logger.error("Error during bulk IP reconciliation: %s", e)
+            raise ProxboxException(
+                message="Bulk VM IP reconciliation failed", http_status_code=502
+            ) from e
     else:
         results = []
 

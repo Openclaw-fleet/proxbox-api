@@ -13,6 +13,9 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timezone
 
+import pytest
+
+from proxbox_api.exception import ProxboxException
 from proxbox_api.services.sync.network import _resolve_vm_interface_ips
 
 _NOW = datetime(2026, 6, 5, tzinfo=timezone.utc)
@@ -23,7 +26,7 @@ def _run_resolve(monkeypatch, existing_for_address):
     """Drive _resolve_vm_interface_ips with a fake NetBox and capture reconcile calls."""
     reconcile_calls: list[dict] = []
 
-    async def _fake_rest_list(nb, path, query=None):
+    async def _fake_rest_list(nb, path, query=None, authoritative=False):
         query = query or {}
         # Address ownership lookup performed by _reconcile_interface_ip. The
         # lookup is mask-agnostic (queries by host) so a differently-masked
@@ -34,6 +37,7 @@ def _run_resolve(monkeypatch, existing_for_address):
             and "vminterface_id" not in query
             and "tag" not in query
         ):
+            assert authoritative
             return list(existing_for_address)
         # cleanup_stale_ips_for_interface (vminterface_id + tag) -> nothing stale.
         return []
@@ -76,20 +80,8 @@ def test_resolve_does_not_reassign_foreign_ip(monkeypatch):
         "assigned_object_type": "virtualization.vminterface",
         "assigned_object_id": 888,
     }
-    results, reconcile_calls = _run_resolve(monkeypatch, [foreign])
-
-    # The foreign record must never be the reconcile target.
-    assert all(call["lookup"].get("id") != 999 for call in reconcile_calls)
-    # The old global address-only reconcile (the steal pattern) must not be used.
-    assert {"address": _ADDR} not in [call["lookup"] for call in reconcile_calls]
-    # Exactly one reconcile: an interface-scoped create for this interface.
-    assert len(reconcile_calls) == 1
-    create_call = reconcile_calls[0]
-    assert create_call["lookup"] == {"address": _ADDR, "vminterface_id": 111}
-    assert create_call["kwargs"].get("strict_lookup") is True
-    assert create_call["payload"]["assigned_object_id"] == 111
-    # The interface still gets an IP id back (its own record, id=123).
-    assert results == [(123, _ADDR)]
+    with pytest.raises(ProxboxException, match="ownership conflict"):
+        _run_resolve(monkeypatch, [foreign])
 
 
 def test_resolve_adopts_unassigned_ip(monkeypatch):
