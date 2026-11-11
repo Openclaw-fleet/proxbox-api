@@ -337,6 +337,19 @@ def inventory_api():
             row = {"id": 43, **payload}
             rows.append(row)
             body = row
+        elif method == "PATCH":
+            updates = (
+                payload
+                if isinstance(payload, list)
+                else [{"id": int(path.rstrip("/").split("/")[-1]), **payload}]
+            )
+            body = []
+            for update in updates:
+                row = next(row for row in rows if row["id"] == update["id"])
+                row.update(update)
+                body.append(row.copy())
+            if not isinstance(payload, list):
+                body = body[0]
         else:
             raise AssertionError(f"Unexpected mutation {method} {path}")
         return ApiResponse(status=200, text=json.dumps(body))
@@ -410,4 +423,161 @@ async def test_invalid_inventory_policy_never_falls_back_to_writable(
     monkeypatch.setenv("PROXBOX_INVENTORY_POLICY_FILE", str(policy))
     with pytest.raises(ProxboxException, match="Inventory ownership policy"):
         await netbox_rest.rest_create_async(api, "/api/dcim/sites/", {"name": "New site"})
+    assert rows == [{"id": 42, "name": "Operator name", "slug": "existing"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bulk", [False, True])
+@pytest.mark.parametrize("allowed", [["description"], []])
+async def test_field_ownership_reconcile_preserves_operator_fields(
+    inventory_api, monkeypatch, tmp_path, bulk, allowed
+):
+    import json
+
+    api, rows = inventory_api
+    path = "/api/virtualization/virtual-machines/"
+    policy = tmp_path / "field-policy.json"
+    policy.write_text(json.dumps({"read_only_paths": [], "patch_fields": {path: allowed}}))
+    monkeypatch.setenv("PROXBOX_INVENTORY_POLICY_FILE", str(policy))
+    rows[0]["comments"] = "Operator notes"
+    desired = {"name": "Source name", "slug": "existing", "description": "Collector description"}
+    if bulk:
+        result = await netbox_rest.rest_bulk_reconcile_async(
+            api,
+            path,
+            payloads=[desired],
+            lookup_fields=["slug"],
+            schema=dict,
+            current_normalizer=lambda row: row,
+            nullable_fields={"comments"},
+        )
+        assert (result.created, result.updated, result.unchanged, result.failed) == (
+            0,
+            int(bool(allowed)),
+            int(not allowed),
+            0,
+        )
+    else:
+        result = await netbox_rest.rest_reconcile_async_with_status(
+            api,
+            path,
+            lookup={"slug": "existing"},
+            payload=desired,
+            schema=dict,
+            current_normalizer=lambda row: row,
+            nullable_fields={"comments"},
+        )
+        assert result.status == ("updated" if allowed else "unchanged")
+    expected = {"id": 42, "name": "Operator name", "slug": "existing", "comments": "Operator notes"}
+    if allowed:
+        expected["description"] = "Collector description"
+    assert rows == [expected]
+    created = await netbox_rest.rest_create_async(api, path, {"name": "Initial source name"})
+    assert created.name == "Initial source name"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("operation", ["patch", "bulk_patch", "record_save"])
+async def test_field_ownership_rejects_direct_mixed_patches(
+    inventory_api, monkeypatch, tmp_path, operation
+):
+    import json
+
+    from proxbox_api.exception import ProxboxException
+
+    api, rows = inventory_api
+    path = "/api/virtualization/virtual-machines/"
+    policy = tmp_path / "field-policy.json"
+    policy.write_text(json.dumps({"read_only_paths": [], "patch_fields": {path: ["description"]}}))
+    monkeypatch.setenv("PROXBOX_INVENTORY_POLICY_FILE", str(policy))
+    patch = {"name": "Forbidden name", "description": "Allowed description"}
+    record = netbox_rest.RestRecord(api, path, rows[0])
+    record.name = patch["name"]
+    record.description = patch["description"]
+    calls = {
+        "patch": lambda: netbox_rest.rest_patch_async(api, path, 42, patch),
+        "bulk_patch": lambda: netbox_rest.rest_bulk_patch_async(
+            api, path, [{"id": 42, "description": "First allowed"}, {"id": 42, **patch}]
+        ),
+        "record_save": record.save,
+    }
+    with pytest.raises(ProxboxException, match="forbids updating these fields"):
+        await calls[operation]()
+    assert rows == [{"id": 42, "name": "Operator name", "slug": "existing"}]
+
+
+@pytest.mark.asyncio
+async def test_field_ownership_intersects_collector_and_overlapping_prefix_limits(
+    inventory_api, monkeypatch, tmp_path
+):
+    import json
+
+    api, rows = inventory_api
+    path = "/api/virtualization/virtual-machines/"
+    policy = tmp_path / "field-policy.json"
+    policy.write_text(
+        json.dumps(
+            {
+                "read_only_paths": [],
+                "patch_fields": {"/api/": ["description", "name"], path: ["description", "slug"]},
+            }
+        )
+    )
+    monkeypatch.setenv("PROXBOX_INVENTORY_POLICY_FILE", str(policy))
+    single = await netbox_rest.rest_reconcile_async_with_status(
+        api,
+        path,
+        lookup={"id": 42},
+        payload={
+            "id": 42,
+            "name": "Forbidden",
+            "slug": "forbidden-rekey",
+            "description": "Allowed",
+        },
+        schema=dict,
+        current_normalizer=lambda row: row,
+    )
+    assert single.status == "updated"
+    assert rows == [
+        {"id": 42, "name": "Operator name", "slug": "existing", "description": "Allowed"}
+    ]
+    result = await netbox_rest.rest_bulk_reconcile_async(
+        api,
+        path,
+        payloads=[{"name": "Forbidden", "slug": "existing", "description": "Restricted by caller"}],
+        lookup_fields=["slug"],
+        schema=dict,
+        current_normalizer=lambda row: row,
+        patchable_fields={"name"},
+    )
+    assert (result.updated, result.unchanged, result.failed) == (0, 1, 0)
+    assert rows == [
+        {"id": 42, "name": "Operator name", "slug": "existing", "description": "Allowed"}
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "fields",
+    [
+        None,
+        [],
+        {"not-canonical": ["name"]},
+        {"/api/dcim/sites/": "name"},
+        {"/api/dcim/sites/": ["name", False]},
+    ],
+)
+async def test_field_ownership_invalid_policy_fails_closed(
+    inventory_api, monkeypatch, tmp_path, fields
+):
+    import json
+
+    from proxbox_api.exception import ProxboxException
+
+    api, rows = inventory_api
+    policy = tmp_path / "field-policy.json"
+    policy.write_text(json.dumps({"read_only_paths": [], "patch_fields": fields}))
+    monkeypatch.setenv("PROXBOX_INVENTORY_POLICY_FILE", str(policy))
+    with pytest.raises(ProxboxException, match="unavailable or invalid"):
+        await netbox_rest.rest_patch_async(api, "/api/dcim/sites/", 42, {"name": "Forbidden"})
     assert rows == [{"id": 42, "name": "Operator name", "slug": "existing"}]
