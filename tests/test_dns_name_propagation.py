@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+
+from netbox_sdk.client import ApiResponse
 
 from proxbox_api.schemas.sync import SyncOverwriteFlags
 from proxbox_api.services.sync.network import (
@@ -234,10 +237,15 @@ def test_bulk_reconcile_vm_interface_ips_gates_dns_name_with_overwrite_flag():
 
         class _FakeResult:
             records: list = []
+            failed: int = 0
 
         async def _fake_bulk(*args, **kwargs):
             captured["patchable_fields"] = kwargs["patchable_fields"]
             return _FakeResult()
+
+        async def request_bounded(method, path, **kwargs):
+            assert method == "GET" and path == "/api/ipam/ip-addresses/"
+            return ApiResponse(status=200, text='{"count":0,"results":[],"next":null}')
 
         with patch(
             "proxbox_api.services.sync.network.rest_bulk_reconcile_async",
@@ -250,7 +258,7 @@ def test_bulk_reconcile_vm_interface_ips_gates_dns_name_with_overwrite_flag():
                 overwrite_ip_address_dns_name=flag_value,
             )
             await bulk_reconcile_vm_interface_ips(
-                nb=object(),
+                nb=SimpleNamespace(client=SimpleNamespace(request_bounded=request_bounded)),
                 ip_payloads=[
                     {
                         "address": "192.0.2.10/24",

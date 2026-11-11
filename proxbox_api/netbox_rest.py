@@ -20,9 +20,11 @@ from pydantic import BaseModel
 
 from proxbox_api.exception import ProxboxException
 from proxbox_api.inventory_policy import (
+    require_vm_placement,
     require_writable_patch,
     require_writable_resource,
     resource_is_read_only,
+    vm_placements,
     writable_patch_fields,
 )
 from proxbox_api.logger import logger
@@ -950,6 +952,7 @@ class RestRecord:
             return self
         require_writable_patch(self._list_path, payload)
         require_writable_patch(self._detail_path, payload)
+        await _preflight_vm_placements(self._api, self._list_path, [{**payload, "id": self.id}])
         try:
             response = await self._api.client.request(
                 "PATCH",
@@ -982,6 +985,7 @@ class RestRecord:
     async def delete(self) -> bool:
         require_writable_resource(self._list_path)
         require_writable_resource(self._detail_path)
+        await _preflight_vm_placements(self._api, self._list_path, [{"id": self.id}])
         try:
             response = await self._api.client.request(
                 "DELETE", self._detail_path, expect_json=False
@@ -1445,6 +1449,34 @@ async def rest_first_async(
     return records[0]
 
 
+async def _preflight_vm_placements(
+    nb: object, path: str, payloads: list[dict], *, creating: bool = False
+) -> None:
+    """Check every target before a batch writes; never trust cached placement."""
+    if vm_placements(path) is None:
+        return
+    for payload in payloads:
+        if creating:
+            require_vm_placement(path, payload)
+            continue
+        record_id = payload.get("id")
+        if not isinstance(record_id, int) or isinstance(record_id, bool) or record_id <= 0:
+            raise ProxboxException(
+                message="VM placement target ID is invalid", http_status_code=403
+            )
+        records = await rest_list_async(
+            nb,
+            "/api/virtualization/virtual-machines/",
+            query={"id": record_id, "limit": 2},
+            authoritative=True,
+        )
+        if len(records) != 1 or type(records[0].id) is not int or records[0].id != record_id:
+            raise ProxboxException(
+                message="VM placement lookup is unverifiable", http_status_code=502
+            )
+        require_vm_placement(path, payload, records[0].serialize())
+
+
 async def rest_create_async(
     nb: object,
     path: str,
@@ -1471,6 +1503,7 @@ async def rest_create_async(
     semaphore = _get_netbox_semaphore()
     normalized_path = _normalize_path(path)
     require_writable_resource(normalized_path)
+    await _preflight_vm_placements(nb, normalized_path, [payload], creating=True)
 
     async def _do_request() -> RestRecord:
         try:
@@ -1610,9 +1643,15 @@ async def _rest_reconcile_async_impl(  # noqa: C901
             else:
                 query_candidate = candidate
             try:
-                existing_record = await rest_first_async(
-                    nb, path, query={**query_candidate, "limit": 2}
-                )
+                if vm_placements(normalized_path) is not None:
+                    records = await rest_list_async(
+                        nb, path, query={**query_candidate, "limit": 2}, authoritative=True
+                    )
+                    existing_record = records[0] if records else None
+                else:
+                    existing_record = await rest_first_async(
+                        nb, path, query={**query_candidate, "limit": 2}
+                    )
             except ProxboxException as exc:
                 # NetBox 4.5.x returns HTTP 400 when filtering by a FK value that
                 # does not exist in the database (e.g. virtual_machine=<id> when
@@ -1671,6 +1710,7 @@ async def _rest_reconcile_async_impl(  # noqa: C901
     async def _reconcile(existing_record: RestRecord) -> tuple[RestRecord, ReconcileStatus]:
         if resource_is_read_only(normalized_path):
             return existing_record, "unchanged"
+        require_vm_placement(normalized_path, desired_payload, existing_record.serialize())
         current_normalized = current_normalizer(existing_record.serialize())
         if supports_model_validation:
             current_model = schema.model_validate(current_normalized)
@@ -1848,6 +1888,7 @@ async def rest_patch_async(
 
     normalized_path = _normalize_path(path)
     require_writable_patch(normalized_path, payload)
+    await _preflight_vm_placements(nb, normalized_path, [{**payload, "id": record_id}])
     detail_path = _detail_path(normalized_path, record_id)
 
     async def _do_request() -> dict[str, object]:
@@ -1903,6 +1944,7 @@ async def rest_bulk_create_async(
     semaphore = _get_netbox_semaphore()
     normalized_path = _normalize_path(path)
     require_writable_resource(normalized_path)
+    await _preflight_vm_placements(nb, normalized_path, payloads, creating=True)
 
     async def _do_request() -> list[RestRecord]:
         try:
@@ -1975,6 +2017,7 @@ async def rest_bulk_patch_async(
     require_writable_resource(normalized_path)
     for payload in updates:
         require_writable_patch(normalized_path, set(payload) - {"id"})
+    await _preflight_vm_placements(nb, normalized_path, updates)
 
     async def _do_request() -> list[RestRecord]:
         try:
@@ -2111,6 +2154,7 @@ async def rest_bulk_delete_async(
     normalized_path = _normalize_path(path)
     require_writable_resource(normalized_path)
     unique_ids = list(dict.fromkeys(ids))  # deduplicate, preserve order
+    await _preflight_vm_placements(nb, normalized_path, [{"id": value} for value in unique_ids])
 
     # For single-item deletes, use detail-path DELETE.
     if len(unique_ids) == 1:
@@ -2351,7 +2395,7 @@ async def rest_bulk_reconcile_async(  # noqa: C901
         seen_desired.add(lookup_key)
         desired_entries.append((desired_payload, lookup))
 
-    if authoritative_lookup:
+    if authoritative_lookup or vm_placements(_normalize_path(path)) is not None:
         existing_records = await rest_list_paginated_async(
             nb, path, base_query=base_query, authoritative=True
         )
@@ -2402,6 +2446,11 @@ async def rest_bulk_reconcile_async(  # noqa: C901
         if lookup_key is None:
             continue
         existing_record = _select_existing(lookup_key)
+        require_vm_placement(
+            path,
+            desired_payload,
+            existing_record.serialize() if existing_record is not None else None,
+        )
         if existing_record is None:
             to_create.append((desired_payload, lookup))
             continue
