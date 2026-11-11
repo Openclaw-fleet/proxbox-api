@@ -9,6 +9,8 @@ from collections.abc import Iterable
 from functools import lru_cache
 from pathlib import Path
 
+from netbox_sdk.client import normalize_request_path
+
 from proxbox_api.exception import ProxboxException
 
 
@@ -65,6 +67,7 @@ def resource_is_read_only(path: str) -> bool:
     filename = os.environ.get("PROXBOX_INVENTORY_POLICY_FILE")
     if filename is None:
         return False
+    path = normalize_request_path(path)
     return any(path.startswith(prefix) for prefix in _read_policy_file(filename)["read_only_paths"])
 
 
@@ -73,6 +76,7 @@ def writable_patch_fields(path: str) -> frozenset[str] | None:
     filename = os.environ.get("PROXBOX_INVENTORY_POLICY_FILE")
     if filename is None:
         return None
+    path = normalize_request_path(path)
     allowed = None
     for prefix, fields in _read_policy_file(filename).get("patch_fields", {}).items():
         if path.startswith(prefix):

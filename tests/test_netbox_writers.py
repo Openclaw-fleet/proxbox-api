@@ -282,7 +282,18 @@ async def test_inventory_policy_preserves_prebound_supporting_objects(
         "record_delete",
     ],
 )
-async def test_inventory_policy_denies_direct_mutations(operation, monkeypatch, tmp_path):
+@pytest.mark.parametrize(
+    "path",
+    [
+        "/api/dcim/sites/",
+        "/api//dcim/sites/",
+        "/api/dcim/../dcim/sites/",
+        "/api/%64cim/sites/",
+        "/api/dcim/site%73/",
+        "/api/dcim/%2e%2e/dcim/sites/",
+    ],
+)
+async def test_inventory_policy_denies_direct_mutations(operation, path, monkeypatch, tmp_path):
     import json
 
     from proxbox_api.exception import ProxboxException
@@ -291,7 +302,6 @@ async def test_inventory_policy_denies_direct_mutations(operation, monkeypatch, 
     policy.write_text(json.dumps({"read_only_paths": ["/api/dcim/sites/"]}))
     monkeypatch.setenv("PROXBOX_INVENTORY_POLICY_FILE", str(policy))
     api = object()
-    path = "/api/dcim/sites/"
     row = netbox_rest.RestRecord(api, path, {"id": 42, "name": "Operator site"})
     row.name = "Source site"
     calls = {
@@ -478,8 +488,17 @@ async def test_field_ownership_reconcile_preserves_operator_fields(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["patch", "bulk_patch", "record_save"])
+@pytest.mark.parametrize(
+    "request_path",
+    [
+        "/api/virtualization/virtual-machines/",
+        "/api//virtualization/virtual-machines/",
+        "/api/dcim/../virtualization/virtual-machines/",
+        "/api/%76irtualization/virtual-machines/",
+    ],
+)
 async def test_field_ownership_rejects_direct_mixed_patches(
-    inventory_api, monkeypatch, tmp_path, operation
+    inventory_api, monkeypatch, tmp_path, operation, request_path
 ):
     import json
 
@@ -490,6 +509,7 @@ async def test_field_ownership_rejects_direct_mixed_patches(
     policy = tmp_path / "field-policy.json"
     policy.write_text(json.dumps({"read_only_paths": [], "patch_fields": {path: ["description"]}}))
     monkeypatch.setenv("PROXBOX_INVENTORY_POLICY_FILE", str(policy))
+    path = request_path
     patch = {"name": "Forbidden name", "description": "Allowed description"}
     record = netbox_rest.RestRecord(api, path, rows[0])
     record.name = patch["name"]
