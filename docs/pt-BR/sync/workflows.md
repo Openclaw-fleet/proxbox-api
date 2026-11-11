@@ -272,6 +272,23 @@ removido: o backend define `status=decommissioning` e adiciona a tag
 relata os candidatos, sem enviar PATCH. Se o guest reaparecer no Proxmox, a
 reconciliacao normal remove o marcador e preserva as demais tags.
 
+O campo `orphan_retirement_rules` do plugin permite restringir a politica por
+site. `null` preserva o comportamento legado; `[]` apenas relata em todos os
+sites. Cada regra informa um `site_id` inteiro positivo, `status` igual a
+`report_only`, `offline` ou `decommissioning`, e um `tag_id` existente opcional
+(somente nas regras que permitem escrita). Sites nao listados apenas relatam.
+O backend le e valida a politica atual sem caches antes da varredura; uma
+politica invalida ou ilegivel interrompe a operacao. A tag adicional e verificada
+antes de alterar a VM. Registros planejados e mudancas recentes de site/cluster
+continuam protegidos. A aposentadoria offline preserva campos, interfaces,
+enderecos e tags existentes e adiciona o marcador normal. O reaparecimento pode
+restaurar o status ativo e remove somente o marcador, nao a tag adicional.
+
+Mantenha `delete_orphans=false` durante uma atualizacao com versoes diferentes:
+backends antigos ignoram o campo novo. Configure uma lista explicita antes de
+habilitar a aposentadoria com o backend correspondente. Esta politica nao
+autoriza exclusao definitiva.
+
 ### Executando a varredura em um sync por etapas
 
 As rotas de full-update executam a varredura sozinhas. Um chamador que dispara

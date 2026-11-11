@@ -328,6 +328,22 @@ backend sets `status=decommissioning` and adds the `proxbox-soft-deleted` tag.
 Existing tags are preserved. A dry-run reports the candidates without sending
 PATCH requests.
 
+The paired plugin's `orphan_retirement_rules` setting can restrict this behavior
+by site. `null` preserves legacy decommissioning; an empty list reports only
+everywhere. Each rule names a positive `site_id`, a `status` of `report_only`,
+`offline` or `decommissioning`, and optionally an existing positive `tag_id`
+(only for writable rules). Unlisted sites report only. The backend reads and
+validates current rules without response caches before sweeping; unreadable or
+invalid policy aborts the sweep. An additional tag must be verified before the
+VM is changed. Planned records and fresh site/cluster changes remain protected.
+Offline retirement adds the same soft-delete marker and preserves existing
+fields, interfaces, addresses and tags. Reappearance may restore active status
+and clears only the marker, not an operator-selected additional tag.
+
+Keep `delete_orphans=false` during a mixed-version upgrade: older backends ignore
+this new field. Configure an explicit allowlist before enabling retirement with
+the matching backend. This setting does not authorize hard deletion.
+
 If the guest reappears in Proxmox, normal VM reconciliation clears the marker
 while preserving every other tag. The paired NetBox plugin's **Soft-deleted
 VMs** page is the only supported hard-delete path for these records. It is
