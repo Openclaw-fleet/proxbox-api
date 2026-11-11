@@ -275,7 +275,7 @@ async def test_sync_ip_individual_maps_shared_mac_guest_ip_to_config_interface(
     def _fake_guest_interfaces(*_args, **_kwargs):
         return guest_interfaces
 
-    async def _fake_rest_list(_nb, path, query=None):
+    async def _fake_rest_list(_nb, path, query=None, *, authoritative=False):
         if path == "/api/virtualization/interfaces/":
             if query == {"virtual_machine_id": 55, "name": "net0"}:
                 return [{"id": 66, "name": "net0", "virtual_machine": 55}]

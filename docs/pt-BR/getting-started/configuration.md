@@ -100,6 +100,41 @@ O modelo armazenado agora inclui:
 }
 ```
 
+## Propriedade dos modelos de inventário
+
+`PROXBOX_INVENTORY_POLICY_FILE` aceita o caminho absoluto de um arquivo JSON
+mantido pelo operador. Monte-o somente para leitura no backend e mantenha a
+política específica da instalação na configuração privada, não no fork público.
+A política inicial aceita prefixos canônicos de coleções da API NetBox:
+
+```json
+{
+  "read_only_paths": [
+    "/api/dcim/sites/",
+    "/api/virtualization/clusters/",
+    "/api/virtualization/cluster-types/"
+  ]
+}
+```
+
+A reconciliação REST reutiliza registros existentes desses recursos sem alterar
+campos mantidos pelo operador. Modelos ausentes falham em vez de serem criados;
+a reconciliação em lote contabiliza essas falhas. Helpers de criação, alteração
+e exclusão, inclusive `save()` e `delete()` dos registros, recusam os caminhos
+protegidos. Outros recursos continuam graváveis. A barra final faz parte do
+prefixo: proteger `sites/` não protege `site-groups/`.
+
+Omitir a variável preserva o comportamento atual; uma lista vazia não protege
+nenhum caminho. Um arquivo configurado ilegível ou inválido bloqueia mutações,
+sem fallback permissivo. Chaves desconhecidas, valores que não sejam listas,
+caminhos não canônicos e nomes de arquivo relativos são inválidos. O arquivo é
+fixado no primeiro uso; reinicie o backend após editá-lo.
+
+Esse limite cobre os coletores REST, não substitui permissões NetBox nem isola
+todo uso do SDK. Use também um token NetBox com privilégios mínimos. A opção
+ainda não restringe posicionamento ou propriedade dos campos de VMs e não
+autoriza ativar outras etapas de sincronização.
+
 ## Endpoints Proxmox
 
 Os registros de endpoint Proxmox sao gerenciados por:
