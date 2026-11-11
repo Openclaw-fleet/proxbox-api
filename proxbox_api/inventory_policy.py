@@ -20,6 +20,27 @@ def _canonical_collection_path(value: object) -> bool:
     )
 
 
+def _validate_vm_placements(rules: object) -> None:
+    if not isinstance(rules, list):
+        raise ValueError("Expected VM placement rules")
+    clusters = set()
+    for rule in rules:
+        if (
+            not isinstance(rule, dict)
+            or set(rule) - {"cluster_id", "site_id", "allow_unplaced"}
+            or any(
+                not isinstance(rule.get(field), int)
+                or isinstance(rule[field], bool)
+                or rule[field] <= 0
+                for field in ("cluster_id", "site_id")
+            )
+            or not isinstance(rule.get("allow_unplaced", False), bool)
+            or rule["cluster_id"] in clusters
+        ):
+            raise ValueError("Expected unique clusters with positive site and cluster IDs")
+        clusters.add(rule["cluster_id"])
+
+
 @lru_cache(maxsize=1)
 def _read_policy_file(filename: str) -> dict:
     try:
@@ -30,7 +51,7 @@ def _read_policy_file(filename: str) -> dict:
         if (
             not isinstance(policy, dict)
             or "read_only_paths" not in policy
-            or set(policy) - {"read_only_paths", "patch_fields"}
+            or set(policy) - {"read_only_paths", "patch_fields", "vm_placements"}
         ):
             raise ValueError("Unknown or missing policy keys")
         paths = policy["read_only_paths"]
@@ -49,6 +70,8 @@ def _read_policy_file(filename: str) -> dict:
             for prefix, fields in patch_fields.items()
         ):
             raise ValueError("Expected collection-to-field allowlists")
+        if "vm_placements" in policy:
+            _validate_vm_placements(policy["vm_placements"])
         return policy
     except (OSError, ValueError, UnicodeError):
         raise ProxboxException(
@@ -102,3 +125,56 @@ def require_writable_resource(path: str) -> None:
             message="Inventory ownership policy forbids writing this resource",
             http_status_code=403,
         )
+
+
+def vm_placements(path: str) -> list[dict] | None:
+    """Return configured VM placement boundaries, or None for legacy behavior."""
+    filename = os.environ.get("PROXBOX_INVENTORY_POLICY_FILE")
+    if filename is None or not normalize_request_path(path).startswith(
+        "/api/virtualization/virtual-machines/"
+    ):
+        return None
+    return _read_policy_file(filename).get("vm_placements")
+
+
+def _placement_id(value: object) -> int | None:
+    if isinstance(value, dict):
+        value = value.get("id")
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else None
+
+
+def require_vm_placement(path: str, desired: dict, current: dict | None = None) -> None:
+    """Validate current and proposed placement independently of writable fields."""
+    rules = vm_placements(path)
+    if rules is None:
+        return
+    target = {**(current or {}), **desired}
+    cluster_id = _placement_id(target.get("cluster"))
+    rule = next((rule for rule in rules if rule["cluster_id"] == cluster_id), None)
+    if rule is None:
+        raise ProxboxException(
+            message="VM placement is outside the configured scope", http_status_code=403
+        )
+    site = target.get("site")
+    if (
+        site is None
+        and current is not None
+        and "site" not in desired
+        and rule.get("allow_unplaced", False)
+    ):
+        site = rule["site_id"]
+    if _placement_id(site) != rule["site_id"]:
+        raise ProxboxException(
+            message="VM placement site is outside the configured scope", http_status_code=403
+        )
+    if current is None:
+        return
+    missing = object()
+    for field in ("site", "cluster"):
+        value = current.get(field, missing)
+        if value is None and rule.get("allow_unplaced", False):
+            continue
+        if _placement_id(value) != rule[f"{field}_id"]:
+            raise ProxboxException(
+                message="VM placement ownership is foreign or unverifiable", http_status_code=403
+            )

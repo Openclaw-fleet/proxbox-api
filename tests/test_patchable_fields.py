@@ -12,9 +12,11 @@ preserves the always-overwrite behavior expected by old callers.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from netbox_sdk.client import ApiResponse
 
 from proxbox_api.schemas.sync import SyncOverwriteFlags
 
@@ -179,19 +181,36 @@ async def test_vm_interface_normalizer_extracts_fk_ids(
 # ---------------------------------------------------------------------------
 
 
+@pytest.fixture
+def empty_ip_inventory():
+    async def request_bounded(method, path, **kwargs):
+        assert method == "GET" and path == "/api/ipam/ip-addresses/"
+        return ApiResponse(status=200, text='{"count":0,"results":[],"next":null}')
+
+    api = SimpleNamespace(client=SimpleNamespace(request_bounded=request_bounded))
+    payload = {
+        "address": "10.0.0.1/24",
+        "assigned_object_type": "virtualization.vminterface",
+        "assigned_object_id": 1,
+    }
+    return api, payload
+
+
 @pytest.mark.asyncio
 async def test_vm_interface_ips_default_includes_status_tags_and_dns_name(
     monkeypatch: pytest.MonkeyPatch,
+    empty_ip_inventory,
 ) -> None:
     from proxbox_api.services.sync import network as network_module
 
     capture = _make_bulk_capture(
         monkeypatch, "proxbox_api.services.sync.network.rest_bulk_reconcile_async"
     )
+    api, payload = empty_ip_inventory
 
     await network_module.bulk_reconcile_vm_interface_ips(
-        nb=object(),
-        ip_payloads=[{"address": "10.0.0.1/24"}],
+        nb=api,
+        ip_payloads=[payload],
         overwrite_flags=SyncOverwriteFlags(),
     )
 
@@ -211,16 +230,18 @@ async def test_vm_interface_ips_drops_key_when_flag_disabled(
     monkeypatch: pytest.MonkeyPatch,
     flag_name: str,
     missing_key: str,
+    empty_ip_inventory,
 ) -> None:
     from proxbox_api.services.sync import network as network_module
 
     capture = _make_bulk_capture(
         monkeypatch, "proxbox_api.services.sync.network.rest_bulk_reconcile_async"
     )
+    api, payload = empty_ip_inventory
 
     await network_module.bulk_reconcile_vm_interface_ips(
-        nb=object(),
-        ip_payloads=[{"address": "10.0.0.1/24"}],
+        nb=api,
+        ip_payloads=[payload],
         overwrite_flags=SyncOverwriteFlags(**{flag_name: False}),
     )
 
@@ -232,16 +253,18 @@ async def test_vm_interface_ips_drops_key_when_flag_disabled(
 @pytest.mark.asyncio
 async def test_vm_interface_ips_none_flags_keeps_all_three(
     monkeypatch: pytest.MonkeyPatch,
+    empty_ip_inventory,
 ) -> None:
     from proxbox_api.services.sync import network as network_module
 
     capture = _make_bulk_capture(
         monkeypatch, "proxbox_api.services.sync.network.rest_bulk_reconcile_async"
     )
+    api, payload = empty_ip_inventory
 
     await network_module.bulk_reconcile_vm_interface_ips(
-        nb=object(),
-        ip_payloads=[{"address": "10.0.0.1/24"}],
+        nb=api,
+        ip_payloads=[payload],
         overwrite_flags=None,
     )
 

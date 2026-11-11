@@ -155,10 +155,41 @@ ownership and NetBox permissions. They do not filter individual nested keys;
 allowing `custom_fields` allows the whole object. Omitted `patch_fields` or
 unmatched paths retain existing behavior. Invalid maps fail closed.
 
+An optional `vm_placements` list constrains VM writes to explicit cluster/site
+pairs, independently of the writable fields:
+
+```json
+{
+  "read_only_paths": ["/api/dcim/sites/", "/api/virtualization/clusters/"],
+  "patch_fields": {
+    "/api/virtualization/virtual-machines/": ["vcpus", "memory"]
+  },
+  "vm_placements": [{"cluster_id": 23, "site_id": 17}]
+}
+```
+
+Use your own NetBox IDs in private configuration. Each cluster may appear once;
+IDs must be positive integers. Missing `vm_placements` preserves legacy behavior;
+an empty list denies all VM mutations. Creation requires an allowed pair.
+Updates and deletes first read the current VM by ID without the response cache;
+foreign or unverifiable placement rejects the operation. A direct bulk operation
+checks every target before its first write. Reconciliation also checks proposed
+placement before filtering fields, so a CPU-only allowlist cannot hide a wrong
+site. These checks add one serial bounded GET per updated/deleted VM, and
+reconciliation uses uncached discovery when the policy is enabled.
+
+The optional rule flag `allow_unplaced: true` permits existing explicitly null
+site/cluster fields when the desired pair identifies the rule. Missing fields
+are not null and remain unverifiable. A CPU-only update may preserve a null site
+when the current cluster identifies the rule; this flag never permits a move
+from another non-null site or cluster, nor an explicit clearing of placement.
+It does not authorize identity adoption, cross-cluster transfers or DR twins.
+
 This is a REST-collector boundary, not a replacement for NetBox permissions or
 an all-purpose SDK sandbox. Use a least-privilege NetBox token as a second
-boundary. This setting does not yet enforce VM site membership or safe
-creation/placement, nor does it make other synchronization stages safe to enable.
+boundary. Placement preflight is not an atomic compare-and-swap: an operator
+can move a VM after the read. It does not bind a Proxmox endpoint to a cluster,
+constrain interface/IP writes, or make other synchronization stages safe to enable.
 
 ## Proxmox Endpoints
 

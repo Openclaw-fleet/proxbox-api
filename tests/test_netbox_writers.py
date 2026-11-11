@@ -364,7 +364,7 @@ def inventory_api():
             raise AssertionError(f"Unexpected mutation {method} {path}")
         return ApiResponse(status=200, text=json.dumps(body))
 
-    return SimpleNamespace(client=SimpleNamespace(request=request)), rows
+    return SimpleNamespace(client=SimpleNamespace(request=request, request_bounded=request)), rows
 
 
 @pytest.mark.asyncio
@@ -601,3 +601,242 @@ async def test_field_ownership_invalid_policy_fails_closed(
     with pytest.raises(ProxboxException, match="unavailable or invalid"):
         await netbox_rest.rest_patch_async(api, "/api/dcim/sites/", 42, {"name": "Forbidden"})
     assert rows == [{"id": 42, "name": "Operator name", "slug": "existing"}]
+
+
+@pytest.fixture
+def placed_inventory(inventory_api, monkeypatch, tmp_path):
+    import json
+
+    api, rows = inventory_api
+    rows[0].update(site={"id": 17}, cluster={"id": 23}, vcpus=2)
+    policy = tmp_path / "placement-policy.json"
+    policy.write_text(
+        json.dumps(
+            {
+                "read_only_paths": [],
+                "patch_fields": {"/api/virtualization/virtual-machines/": ["vcpus"]},
+                "vm_placements": [{"cluster_id": 23, "site_id": 17}],
+            }
+        )
+    )
+    monkeypatch.setenv("PROXBOX_INVENTORY_POLICY_FILE", str(policy))
+    return api, rows
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bulk", [False, True])
+@pytest.mark.parametrize("site,cluster", [(17, 23), (18, 23), (17, 24)])
+async def test_vm_placement_reconcile_checks_desired_placement_before_field_filtering(
+    placed_inventory, bulk, site, cluster
+):
+    from proxbox_api.exception import ProxboxException
+
+    api, rows = placed_inventory
+    path = "/api/virtualization/virtual-machines/"
+    desired = {"slug": "existing", "vcpus": 3, "cluster": cluster, "site": site}
+
+    async def reconcile():
+        if bulk:
+            return await netbox_rest.rest_bulk_reconcile_async(
+                api,
+                path,
+                payloads=[desired],
+                lookup_fields=["slug"],
+                schema=dict,
+                current_normalizer=lambda row: row,
+            )
+        return await netbox_rest.rest_reconcile_async_with_status(
+            api,
+            path,
+            lookup={"slug": "existing"},
+            payload=desired,
+            schema=dict,
+            current_normalizer=lambda row: row,
+        )
+
+    if (site, cluster) == (17, 23):
+        await reconcile()
+        assert rows[0]["vcpus"] == 3
+    else:
+        with pytest.raises(ProxboxException, match="VM placement"):
+            await reconcile()
+        assert rows[0]["vcpus"] == 2
+    assert rows[0]["site"] == {"id": 17}
+    assert rows[0]["cluster"] == {"id": 23}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation", ["patch", "bulk_patch", "record_save", "delete", "record_delete"]
+)
+async def test_vm_placement_direct_writes_reject_a_fresh_foreign_site(placed_inventory, operation):
+    from proxbox_api.exception import ProxboxException
+
+    api, rows = placed_inventory
+    path = "/api/virtualization/virtual-machines/"
+    # Warm the normal cache and capture a record before an operator relocates it.
+    record = await netbox_rest.rest_first_async(api, path, query={"id": 42, "limit": 2})
+    record.vcpus = 3
+    rows[0]["site"] = {"id": 18}
+    calls = {
+        "patch": lambda: netbox_rest.rest_patch_async(api, path, 42, {"vcpus": 3}),
+        "bulk_patch": lambda: netbox_rest.rest_bulk_patch_async(
+            api, path, [{"id": 42, "vcpus": 3}]
+        ),
+        "record_save": record.save,
+        "delete": lambda: netbox_rest.rest_bulk_delete_async(api, path, [42]),
+        "record_delete": record.delete,
+    }
+    with pytest.raises(ProxboxException, match="VM placement"):
+        await calls[operation]()
+    assert rows == [
+        {
+            "id": 42,
+            "name": "Operator name",
+            "slug": "existing",
+            "site": {"id": 18},
+            "cluster": {"id": 23},
+            "vcpus": 2,
+        }
+    ]
+
+
+@pytest.mark.asyncio
+async def test_vm_placement_bulk_rejection_precedes_every_write(placed_inventory):
+    from proxbox_api.exception import ProxboxException
+
+    api, rows = placed_inventory
+    path = "/api/virtualization/virtual-machines/"
+    rows.append({"id": 43, "site": {"id": 18}, "cluster": {"id": 23}, "vcpus": 5})
+    with pytest.raises(ProxboxException, match="VM placement"):
+        await netbox_rest.rest_bulk_patch_async(
+            api, path, [{"id": 42, "vcpus": 3}, {"id": 43, "vcpus": 6}]
+        )
+    assert [row["vcpus"] for row in rows] == [2, 5]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("identity", [42.0, "42"])
+async def test_vm_placement_unverifiable_lookup_cannot_authorize_a_write(
+    placed_inventory, identity
+):
+    from proxbox_api.exception import ProxboxException
+
+    api, rows = placed_inventory
+    rows[0]["id"] = identity
+    with pytest.raises(ProxboxException, match="lookup is unverifiable"):
+        await netbox_rest.rest_patch_async(
+            api, "/api/virtualization/virtual-machines/", 42, {"vcpus": 3}
+        )
+    assert rows[0]["vcpus"] == 2
+
+
+@pytest.mark.asyncio
+async def test_vm_placement_empty_scope_blocks_even_a_matching_vm(placed_inventory):
+    import json
+    import os
+    from pathlib import Path
+
+    from proxbox_api.exception import ProxboxException
+
+    api, rows = placed_inventory
+    policy = Path(os.environ["PROXBOX_INVENTORY_POLICY_FILE"])
+    contents = json.loads(policy.read_text())
+    contents["vm_placements"] = []
+    policy.write_text(json.dumps(contents))
+    with pytest.raises(ProxboxException, match="outside the configured scope"):
+        await netbox_rest.rest_patch_async(
+            api, "/api/virtualization/virtual-machines/", 42, {"vcpus": 3}
+        )
+    assert rows[0]["vcpus"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bulk", [False, True])
+async def test_vm_placement_creation_checks_the_whole_batch(placed_inventory, bulk):
+    from proxbox_api.exception import ProxboxException
+
+    api, rows = placed_inventory
+    path = "/api/virtualization/virtual-machines/"
+    valid = {"name": "New VM", "site": 17, "cluster": 23}
+    foreign = {"name": "Foreign VM", "site": 18, "cluster": 23}
+    with pytest.raises(ProxboxException, match="VM placement"):
+        if bulk:
+            await netbox_rest.rest_bulk_create_async(api, path, [valid, foreign])
+        else:
+            await netbox_rest.rest_create_async(api, path, foreign)
+    assert len(rows) == 1
+    created = await netbox_rest.rest_create_async(api, path, valid)
+    assert created.serialize() == {"id": 43, **valid}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("allow_unplaced", [False, True])
+@pytest.mark.parametrize("field_present", [False, True])
+async def test_vm_placement_legacy_adoption_requires_explicit_null_and_opt_in(
+    placed_inventory, monkeypatch, allow_unplaced, field_present
+):
+    import json
+    import os
+    from pathlib import Path
+
+    from proxbox_api.exception import ProxboxException
+
+    api, rows = placed_inventory
+    policy = Path(os.environ["PROXBOX_INVENTORY_POLICY_FILE"])
+    contents = json.loads(policy.read_text())
+    contents["vm_placements"][0]["allow_unplaced"] = allow_unplaced
+    policy.write_text(json.dumps(contents))
+    if field_present:
+        rows[0]["site"] = None
+    else:
+        rows[0].pop("site")
+
+    async def reconcile():
+        return await netbox_rest.rest_reconcile_async_with_status(
+            api,
+            "/api/virtualization/virtual-machines/",
+            lookup={"slug": "existing"},
+            payload={"slug": "existing", "site": 17, "cluster": 23, "vcpus": 3},
+            schema=dict,
+            current_normalizer=lambda row: row,
+        )
+
+    if allow_unplaced and field_present:
+        await reconcile()
+        assert rows[0]["vcpus"] == 3
+    else:
+        with pytest.raises(ProxboxException, match="VM placement"):
+            await reconcile()
+        assert rows[0]["vcpus"] == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "rules",
+    [
+        None,
+        {},
+        [{"cluster_id": True, "site_id": 17}],
+        [{"cluster_id": 23, "site_id": 17.1}],
+        [{"cluster_id": 23, "site_id": 17, "allow_unplaced": "true"}],
+        [{"cluster_id": 23, "site_id": 17}, {"cluster_id": 23, "site_id": 18}],
+    ],
+)
+async def test_vm_placement_malformed_policy_never_permits_a_write(placed_inventory, rules):
+    import json
+    import os
+    from pathlib import Path
+
+    from proxbox_api.exception import ProxboxException
+
+    api, rows = placed_inventory
+    policy = Path(os.environ["PROXBOX_INVENTORY_POLICY_FILE"])
+    contents = json.loads(policy.read_text())
+    contents["vm_placements"] = rules
+    policy.write_text(json.dumps(contents))
+    with pytest.raises(ProxboxException, match="unavailable or invalid"):
+        await netbox_rest.rest_patch_async(
+            api, "/api/virtualization/virtual-machines/", 42, {"vcpus": 3}
+        )
+    assert rows[0]["vcpus"] == 2

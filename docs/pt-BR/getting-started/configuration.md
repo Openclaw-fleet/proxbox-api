@@ -155,10 +155,42 @@ permitir `custom_fields` permite o objeto inteiro. Omissão de `patch_fields`
 ou caminhos sem correspondência preservam o comportamento atual. Mapas
 inválidos bloqueiam mutações.
 
+A lista opcional `vm_placements` limita gravações de VMs a pares explícitos de
+cluster/site, independentemente dos campos graváveis:
+
+```json
+{
+  "read_only_paths": ["/api/dcim/sites/", "/api/virtualization/clusters/"],
+  "patch_fields": {
+    "/api/virtualization/virtual-machines/": ["vcpus", "memory"]
+  },
+  "vm_placements": [{"cluster_id": 23, "site_id": 17}]
+}
+```
+
+Use seus próprios IDs NetBox na configuração privada. Cada cluster pode aparecer
+uma vez; IDs devem ser inteiros positivos. Omissão de `vm_placements` preserva
+o comportamento anterior; uma lista vazia bloqueia todas as mutações de VMs.
+Criação exige um par permitido. Alterações e exclusões consultam a VM atual por
+ID sem cache; posicionamento externo ou não verificável bloqueia a operação.
+Uma operação direta em lote verifica todos os alvos antes da primeira gravação.
+A reconciliação também verifica o posicionamento proposto antes de filtrar os
+campos: permitir apenas CPU não oculta um site incorreto. Há um GET limitado e
+sequencial adicional por VM alterada/excluída; a descoberta da reconciliação
+também ignora o cache quando a política está ativa.
+
+A opção `allow_unplaced: true` permite campos site/cluster explicitamente nulos
+no registro existente quando o par desejado identifica a regra. Campos ausentes
+não são nulos e continuam não verificáveis. Uma atualização somente de CPU pode
+preservar site nulo se o cluster atual identificar a regra. A opção nunca permite
+mover de outro site/cluster não nulo nem limpar explicitamente o posicionamento.
+Ela não autoriza adoção de identidade, transferências entre clusters ou DR twins.
+
 Esse limite cobre os coletores REST, não substitui permissões NetBox nem isola
 todo uso do SDK. Use também um token NetBox com privilégios mínimos. A opção
-ainda não garante pertencimento a um site nem criação/posicionamento seguros
-de VMs e não autoriza ativar outras etapas de sincronização.
+não oferece compare-and-swap atômico: um operador pode mover a VM após a leitura.
+Ela não vincula um endpoint Proxmox ao cluster, não limita gravações de
+interfaces/IPs e não autoriza ativar outras etapas de sincronização.
 
 ## Endpoints Proxmox
 
