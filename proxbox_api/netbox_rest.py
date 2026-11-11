@@ -19,6 +19,7 @@ from netbox_sdk.client import ApiResponse
 from pydantic import BaseModel
 
 from proxbox_api.exception import ProxboxException
+from proxbox_api.inventory_policy import require_writable_resource, resource_is_read_only
 from proxbox_api.logger import logger
 from proxbox_api.netbox_sdk_helpers import to_dict
 from proxbox_api.schemas.netbox.extras import TagSchema
@@ -942,6 +943,8 @@ class RestRecord:
         }
         if not payload:
             return self
+        require_writable_resource(self._list_path)
+        require_writable_resource(self._detail_path)
         try:
             response = await self._api.client.request(
                 "PATCH",
@@ -972,6 +975,8 @@ class RestRecord:
         return self
 
     async def delete(self) -> bool:
+        require_writable_resource(self._list_path)
+        require_writable_resource(self._detail_path)
         try:
             response = await self._api.client.request(
                 "DELETE", self._detail_path, expect_json=False
@@ -1460,6 +1465,7 @@ async def rest_create_async(
     api = _unwrap_api(nb)
     semaphore = _get_netbox_semaphore()
     normalized_path = _normalize_path(path)
+    require_writable_resource(normalized_path)
 
     async def _do_request() -> RestRecord:
         try:
@@ -1658,6 +1664,8 @@ async def _rest_reconcile_async_impl(  # noqa: C901
         return None
 
     async def _reconcile(existing_record: RestRecord) -> tuple[RestRecord, ReconcileStatus]:
+        if resource_is_read_only(normalized_path):
+            return existing_record, "unchanged"
         current_normalized = current_normalizer(existing_record.serialize())
         if supports_model_validation:
             current_model = schema.model_validate(current_normalized)
@@ -1829,6 +1837,7 @@ async def rest_patch_async(
     semaphore = _get_netbox_semaphore()
 
     normalized_path = _normalize_path(path)
+    require_writable_resource(normalized_path)
     detail_path = _detail_path(normalized_path, record_id)
 
     async def _do_request() -> dict[str, object]:
@@ -1883,6 +1892,7 @@ async def rest_bulk_create_async(
     api = _unwrap_api(nb)
     semaphore = _get_netbox_semaphore()
     normalized_path = _normalize_path(path)
+    require_writable_resource(normalized_path)
 
     async def _do_request() -> list[RestRecord]:
         try:
@@ -1952,6 +1962,7 @@ async def rest_bulk_patch_async(
     api = _unwrap_api(nb)
     semaphore = _get_netbox_semaphore()
     normalized_path = _normalize_path(path)
+    require_writable_resource(normalized_path)
 
     async def _do_request() -> list[RestRecord]:
         try:
@@ -2086,6 +2097,7 @@ async def rest_bulk_delete_async(
     api = _unwrap_api(nb)
     semaphore = _get_netbox_semaphore()
     normalized_path = _normalize_path(path)
+    require_writable_resource(normalized_path)
     unique_ids = list(dict.fromkeys(ids))  # deduplicate, preserve order
 
     # For single-item deletes, use detail-path DELETE.
@@ -2295,6 +2307,8 @@ async def rest_bulk_reconcile_async(  # noqa: C901
     supports_model_validation = hasattr(schema, "model_validate") and hasattr(schema, "model_dump")
     resolved_batch_size = _normalize_bulk_batch_size(batch_size)
     resolved_batch_delay_ms = _normalize_bulk_batch_delay_ms(batch_delay_ms)
+    if resource_is_read_only(_normalize_path(path)):
+        patchable_fields = frozenset()
 
     desired_entries: list[tuple[dict[str, object], dict[str, object]]] = []
     seen_desired: set[tuple[tuple[str, object], ...]] = set()

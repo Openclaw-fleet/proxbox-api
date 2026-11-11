@@ -246,3 +246,168 @@ async def test_with_status_wrapper_returns_reconcile_result(
 
     assert isinstance(result, ReconcileResult)
     assert result.status in {"created", "updated", "unchanged"}
+
+
+@pytest.mark.asyncio
+async def test_inventory_policy_preserves_prebound_supporting_objects(
+    patch_rest, monkeypatch, tmp_path
+):
+    import json
+
+    policy = tmp_path / "inventory-policy.json"
+    policy.write_text(json.dumps({"read_only_paths": ["/api/virtualization/cluster-types/"]}))
+    monkeypatch.setenv("PROXBOX_INVENTORY_POLICY_FILE", str(policy))
+    existing = _FakeRecord(_existing_cluster_type_payload(name="Operator name"), record_id=42)
+    patch_rest["holder"]["existing"] = existing
+
+    result = await upsert_cluster_type(object(), mode="cluster", tag_refs=_PROXBOX_TAG)
+
+    assert result.status == "unchanged"
+    assert result.record.serialize()["name"] == "Operator name"
+    assert result.record.id == 42
+    assert existing.patched_fields == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "operation",
+    [
+        "create",
+        "patch",
+        "bulk_create",
+        "bulk_patch",
+        "delete_one",
+        "delete_many",
+        "record_save",
+        "record_delete",
+    ],
+)
+async def test_inventory_policy_denies_direct_mutations(operation, monkeypatch, tmp_path):
+    import json
+
+    from proxbox_api.exception import ProxboxException
+
+    policy = tmp_path / "inventory-policy.json"
+    policy.write_text(json.dumps({"read_only_paths": ["/api/dcim/sites/"]}))
+    monkeypatch.setenv("PROXBOX_INVENTORY_POLICY_FILE", str(policy))
+    api = object()
+    path = "/api/dcim/sites/"
+    row = netbox_rest.RestRecord(api, path, {"id": 42, "name": "Operator site"})
+    row.name = "Source site"
+    calls = {
+        "create": lambda: netbox_rest.rest_create_async(api, path, {"name": "Source site"}),
+        "patch": lambda: netbox_rest.rest_patch_async(api, path, 42, {"name": "Source site"}),
+        "bulk_create": lambda: netbox_rest.rest_bulk_create_async(
+            api, path, [{"name": "Source site"}]
+        ),
+        "bulk_patch": lambda: netbox_rest.rest_bulk_patch_async(
+            api, path, [{"id": 42, "name": "Source site"}]
+        ),
+        "delete_one": lambda: netbox_rest.rest_bulk_delete_async(api, path, [42]),
+        "delete_many": lambda: netbox_rest.rest_bulk_delete_async(api, path, [42, 43]),
+        "record_save": row.save,
+        "record_delete": row.delete,
+    }
+    with pytest.raises(ProxboxException, match="Inventory ownership policy"):
+        await calls[operation]()
+
+
+@pytest.fixture
+def inventory_api():
+    import json
+    from types import SimpleNamespace
+
+    from netbox_sdk.client import ApiResponse
+
+    rows = [{"id": 42, "name": "Operator name", "slug": "existing"}]
+
+    async def request(method, path, *, query=None, payload=None, **kwargs):
+        if method == "GET":
+            selected = [
+                row
+                for row in rows
+                if all(
+                    row.get(key) == value
+                    for key, value in (query or {}).items()
+                    if key not in {"limit", "offset"}
+                )
+            ]
+            body = {"count": len(selected), "next": None, "results": selected}
+        elif method == "POST":
+            row = {"id": 43, **payload}
+            rows.append(row)
+            body = row
+        else:
+            raise AssertionError(f"Unexpected mutation {method} {path}")
+        return ApiResponse(status=200, text=json.dumps(body))
+
+    return SimpleNamespace(client=SimpleNamespace(request=request)), rows
+
+
+@pytest.mark.asyncio
+async def test_read_only_bulk_preserves_existing_and_reports_missing_models(
+    inventory_api, monkeypatch, tmp_path
+):
+    import json
+
+    api, rows = inventory_api
+    policy = tmp_path / "inventory-policy.json"
+    policy.write_text(json.dumps({"read_only_paths": ["/api/virtualization/cluster-types/"]}))
+    monkeypatch.setenv("PROXBOX_INVENTORY_POLICY_FILE", str(policy))
+    result = await netbox_rest.rest_bulk_reconcile_async(
+        api,
+        "/api/virtualization/cluster-types/",
+        payloads=[{"name": "Source name", "slug": "existing"}, {"name": "New type", "slug": "new"}],
+        lookup_fields=["slug"],
+        schema=dict,
+        current_normalizer=lambda row: row,
+    )
+    assert (result.created, result.updated, result.unchanged, result.failed) == (0, 0, 1, 1)
+    assert [row.serialize() for row in result.records] == rows
+    assert rows == [{"id": 42, "name": "Operator name", "slug": "existing"}]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "path", ["/api/virtualization/virtual-machines/", "/api/dcim/site-groups/"]
+)
+async def test_inventory_policy_leaves_other_resources_writable(
+    inventory_api, monkeypatch, tmp_path, path
+):
+    import json
+
+    api, rows = inventory_api
+    policy = tmp_path / "inventory-policy.json"
+    policy.write_text(json.dumps({"read_only_paths": ["/api/dcim/sites/"]}))
+    monkeypatch.setenv("PROXBOX_INVENTORY_POLICY_FILE", str(policy))
+    created = await netbox_rest.rest_create_async(api, path, {"name": "New inventory"})
+    assert created.serialize() == {"id": 43, "name": "New inventory"}
+    assert rows[-1] == created.serialize()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "{",
+        "[]",
+        "{}",
+        '{"read_only_paths": null}',
+        '{"read_only_paths": ["/api/dcim/sites/?all=true"]}',
+        '{"read_only_paths": ["/api/dcim/../sites/"]}',
+        None,
+    ],
+)
+async def test_invalid_inventory_policy_never_falls_back_to_writable(
+    inventory_api, monkeypatch, tmp_path, contents
+):
+    from proxbox_api.exception import ProxboxException
+
+    api, rows = inventory_api
+    policy = tmp_path / "inventory-policy.json"
+    if contents is not None:
+        policy.write_text(contents)
+    monkeypatch.setenv("PROXBOX_INVENTORY_POLICY_FILE", str(policy))
+    with pytest.raises(ProxboxException, match="Inventory ownership policy"):
+        await netbox_rest.rest_create_async(api, "/api/dcim/sites/", {"name": "New site"})
+    assert rows == [{"id": 42, "name": "Operator name", "slug": "existing"}]

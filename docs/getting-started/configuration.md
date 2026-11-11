@@ -101,6 +101,41 @@ The stored model now includes:
 }
 ```
 
+## Inventory model ownership
+
+`PROXBOX_INVENTORY_POLICY_FILE` optionally names an absolute path to an
+operator-owned JSON file. Mount it read-only into the backend and keep
+deployment-specific policy in private configuration, not in a public fork.
+The initial policy supports canonical NetBox API collection prefixes:
+
+```json
+{
+  "read_only_paths": [
+    "/api/dcim/sites/",
+    "/api/virtualization/clusters/",
+    "/api/virtualization/cluster-types/"
+  ]
+}
+```
+
+For these resources, REST reconciliation reuses existing records without
+changing their operator-owned fields. Missing models fail instead of being
+created; bulk reconciliation counts those failures. Direct create, patch and
+delete helpers, including record saves and deletes, refuse protected paths.
+Other resources remain writable. Prefixes include their trailing slash, so
+protecting `sites/` does not protect `site-groups/`.
+
+Omitting the variable preserves existing behavior; an explicit empty path list
+protects nothing. A configured but unreadable or invalid file rejects mutations
+instead of falling back to unrestricted writes. Unknown keys, non-list values,
+noncanonical paths and relative filenames are invalid. The file is pinned on
+first use; restart the backend after editing it.
+
+This is a REST-collector boundary, not a replacement for NetBox permissions or
+an all-purpose SDK sandbox. Use a least-privilege NetBox token as a second
+boundary. This setting does not yet constrain VM placement or VM field
+ownership, nor does it make other synchronization stages safe to enable.
+
 ## Proxmox Endpoints
 
 Proxmox endpoint records are managed with:
